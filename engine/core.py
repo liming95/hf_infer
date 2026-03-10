@@ -13,6 +13,15 @@ class StopOnToken(StoppingCriteria):
         return input_ids[0, -1].item() in self.stop_token_ids
 
 
+def my_decode(
+    model,
+    input_ids,
+    generation_config=None,
+    **kwargs
+):
+
+    strategy = generation_config.my_strategy
+    print(f"Using decoding strategy: {strategy}")
 
 class HFEngine:
     def __init__(self, model_name_or_path: str, device="cuda"):
@@ -85,6 +94,34 @@ class HFEngine:
             output_text += new_text
         thread.join()
         return output_text
+    
+    def sd_generate_test(self, prompt: str) -> str:
+        # Placeholder for future implementation of a custom decoding strategy
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        # gen_config = self.model.generation_config.clone()
+        import copy
+        gen_config = copy.deepcopy(self.model.generation_config)
+
+        gen_config.my_strategy = "tree"
+
+        self.model.generate(
+            **inputs,
+            generation_config=gen_config,
+            custom_generate=my_decode,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            stopping_criteria=self.stop_criteria
+        )
+
+def test_sd_generate():
+    model_path = "/workspace/models/Qwen2.5-1.5B-Instruct"
+    engine = HFEngine(model_path)
+    prompt = "What is the capital of France?"
+    response = engine.sd_generate_test(prompt)
+    print(f"SD Generated Response: {response}")
 
 # Example usage:
 def test_engine():
@@ -114,4 +151,5 @@ def test_engine():
     debug_token_diff(engine.tokenizer, response, streamed_response)
 
 if __name__ == "__main__":
-    test_engine()
+    # test_engine()
+    test_sd_generate()

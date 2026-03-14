@@ -1,10 +1,13 @@
 from transformers import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, BaseStreamer
-from .sd_core import HistoryLookupCandidateGenerator
 from transformers.generation.utils import (
     GenerateDecoderOnlyOutput,
     GenerateEncoderDecoderOutput,
     GenerateNonBeamOutput,
 )
+from .candidate_generator import HistoryLookupCandidateGenerator
+import torch
+import copy
+from typing import Any, Optional
 
 ALL_CACHE_NAMES = [
     "past_key_values",  # default
@@ -199,7 +202,14 @@ def history_speculative_decoding(
         ):
             raise ValueError("assisted generate is not supported with Static cache classes`")
         # my candidate generator
-        candidate_generator = HistoryLookupCandidateGenerator(input_ids, historydb=historydb)
+        candidate_generator = HistoryLookupCandidateGenerator(
+                eos_token_id=generation_config._eos_token_tensor,
+                num_output_tokens=generation_config.prompt_lookup_num_tokens,
+                max_matching_ngram_size=generation_config.max_matching_ngram_size or 4,
+                max_length=generation_config.max_length,
+                logits_processor=logits_processor,
+                vocab_size=model.config.get_text_config().vocab_size,
+        )
         # init values
         do_sample = generation_config.do_sample
         output_attentions = generation_config.output_attentions
@@ -231,16 +241,21 @@ def history_speculative_decoding(
 
         this_peer_finished = False
         is_first_iteration = True  # to preserve the same API in the output as other generation methods
+
+        prompt_ids = input_ids[0].tolist()
+        historydb = generation_config.historydb
         while model._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             cur_len = input_ids.shape[1]
 
             #  1. Fetch candidate sequences from a `CandidateGenerator` and move to the correct device
-            candidate_input_ids, candidate_logits = candidate_generator.get_candidates(input_ids)
+            candidate_input_ids, candidate_logits = candidate_generator.get_candidates(prompt_ids, input_ids, historydb)
             candidate_input_ids = candidate_input_ids.to(model.device)
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(model.device)
 
             candidate_length = candidate_input_ids.shape[1] - input_ids.shape[1]
+            if candidate_length < 0:
+                candidate_length = 0
             is_done_candidate = stopping_criteria(candidate_input_ids, None)
 
             # 2. Use the original model to obtain the next token logits given the candidate sequence. We obtain

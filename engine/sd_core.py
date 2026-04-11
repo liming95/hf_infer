@@ -56,8 +56,8 @@ def test_sd_engine():
     historydb.add(prompt_ids, history_ids)
 
     # sd generation
-    sd_generated_ids = engine.sd_generate(prompt, historydb)
-    print("Generated output:", sd_generated_ids)
+    sd_generated_text = engine.sd_generate(prompt, historydb)
+    print("Generated output:", sd_generated_text)
 
 if __name__ == "__main__":
     test_sd_engine()

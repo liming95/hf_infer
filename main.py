@@ -1,4 +1,4 @@
-from engine.core import test_engine, HFEngine, test_sd_generate
+from engine.core import test_engine, HFEngine, test_custom_generate
 from engine.sgl_ref import SGLangEngine
 from engine.tool import check_output, token_match_rate, debug_token_diff, compare_tokens
 
@@ -34,4 +34,4 @@ if __name__ == "__main__":
     # test_engine()
     # test_sglang_engine()
     # compare_engines()
-    test_sd_generate()
+    test_custom_generate()

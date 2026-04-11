@@ -115,8 +115,8 @@ class HFEngine:
             top_k=self.top_k,
             stopping_criteria=self.stop_criteria
         )
-
-def test_sd_generate():
+# case for test
+def test_custom_generate():
     model_path = "/workspace/models/Qwen2.5-1.5B-Instruct"
     engine = HFEngine(model_path)
     prompt = "What is the capital of France?"
@@ -152,4 +152,4 @@ def test_engine():
 
 if __name__ == "__main__":
     # test_engine()
-    test_sd_generate()
+    test_custom_generate()

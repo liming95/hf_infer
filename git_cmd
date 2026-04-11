@@ -1,0 +1,2 @@
+GIT_SSH_COMMAND='ssh -i /workspace/.ssh/github -o IdentitiesOnly=yes' git pull
+GIT_SSH_COMMAND='ssh -i /workspace/.ssh/github -o IdentitiesOnly=yes' git push

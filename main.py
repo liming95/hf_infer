@@ -1,6 +1,7 @@
 from engine.core import test_engine, HFEngine, test_custom_generate
 from engine.sgl_ref import SGLangEngine
 from engine.tool import check_output, token_match_rate, debug_token_diff, compare_tokens
+from engine.sd_core import test_sd_engine
 
 def compare_engines():
     model_path = "/workspace/models/Qwen2.5-1.5B-Instruct"
@@ -34,4 +35,5 @@ if __name__ == "__main__":
     # test_engine()
     # test_sglang_engine()
     # compare_engines()
-    test_custom_generate()
+    # test_custom_generate()
+    test_sd_engine()

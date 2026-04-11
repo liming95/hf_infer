@@ -1,4 +1,6 @@
-from transformers import LogitsProcessorList, StoppingCriteriaList, GenerationConfig, BaseStreamer
+from transformers import LogitsProcessorList, StoppingCriteriaList, GenerationConfig
+from transformers.generation.streamers import BaseStreamer
+
 from transformers.generation.utils import (
     GenerateDecoderOnlyOutput,
     GenerateEncoderDecoderOutput,
@@ -248,7 +250,10 @@ def history_speculative_decoding(
             cur_len = input_ids.shape[1]
 
             #  1. Fetch candidate sequences from a `CandidateGenerator` and move to the correct device
+            print(f"input_ids: {input_ids}")
             candidate_input_ids, candidate_logits = candidate_generator.get_candidates(prompt_ids, input_ids, historydb)
+            print(f"candidate_input_ids: {candidate_input_ids}")
+
             candidate_input_ids = candidate_input_ids.to(model.device)
             if candidate_logits is not None:
                 candidate_logits = candidate_logits.to(model.device)
@@ -335,6 +340,7 @@ def history_speculative_decoding(
                 if is_done_candidate and n_matches == candidate_length:
                     n_matches -= 1
                 valid_tokens = selected_tokens[:, : n_matches + 1]
+            print(f"n_matches: {n_matches}")
 
             # 4. Update variables according to the number of matching assistant tokens. Remember: the token generated
             # by the model after the last candidate match is also valid, as it is generated from a correct sequence.

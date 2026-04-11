@@ -1,5 +1,6 @@
-from .hf_tools import history_speculative_decoding
-from .candidate_generator import HistoryDB
+from engine.hf_tool import history_speculative_decoding
+from engine.candidate_generator import HistoryDB
+from engine.core import HFEngine
 
 class SDEngine(HFEngine):
     def __init__(self, model_name_or_path, device="cuda"):

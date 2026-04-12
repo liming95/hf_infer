@@ -341,6 +341,27 @@ And you can generate aggregate comparison figures from the saved experiment file
 python sim/visualizer.py --results-json sim_results.json --output-dir sim/plots
 ```
 
+If you specifically want to understand the impact of `chunk_size`, run a focused
+chunk sweep first:
+
+```bash
+python sim/experiments.py ^
+  --suite chunk ^
+  --duration 20 ^
+  --arrival-rate 10 ^
+  --batch-size 16 ^
+  --accept-rate 0.85 ^
+  --output-json sim/chunk_results.json ^
+  --output-md sim/chunk_report.md ^
+  --output-csv sim/chunk_summary.csv
+```
+
+And then visualize it:
+
+```bash
+python sim/visualizer.py --results-json sim/chunk_results.json --output-dir sim/plots
+```
+
 This is where you should look for:
 
 - throughput gain regions

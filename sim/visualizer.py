@@ -74,23 +74,24 @@ class SimulationVisualizer:
             ]
 
             axes[0].plot(x_labels, throughput, marker="o", linewidth=2)
-            axes[0].set_title(f"{group_name}: Throughput")
-            axes[0].set_ylabel("tokens/sec")
+            axes[0].set_title(f"{group_name}: System Throughput")
+            axes[0].set_ylabel("Committed tokens / sec")
             axes[0].grid(alpha=0.3)
 
             axes[1].plot(x_labels, latency, marker="o", color="tab:red", linewidth=2)
-            axes[1].set_title(f"{group_name}: Avg Latency")
-            axes[1].set_ylabel("sec")
+            axes[1].set_title(f"{group_name}: Average End-to-End Latency")
+            axes[1].set_ylabel("Seconds")
             axes[1].grid(alpha=0.3)
 
             axes[2].plot(x_labels, stability, marker="o", color="tab:green", linewidth=2)
-            axes[2].set_title(f"{group_name}: Stability")
-            axes[2].set_ylabel("ratio")
+            axes[2].set_title(f"{group_name}: Stability Ratio")
+            axes[2].set_ylabel("Completed / Arrived")
             axes[2].grid(alpha=0.3)
 
             axes[3].plot(x_labels, speedup, marker="o", color="tab:purple", linewidth=2, label="speedup vs baseline")
             axes[3].plot(x_labels, kv_peak, marker="x", color="tab:orange", linewidth=2, label="peak kv util")
-            axes[3].set_title(f"{group_name}: Baseline Delta / KV")
+            axes[3].axhline(1.0, linestyle="--", color="gray", linewidth=1)
+            axes[3].set_title(f"{group_name}: Speedup vs Baseline and KV Pressure")
             axes[3].legend()
             axes[3].grid(alpha=0.3)
 
@@ -99,6 +100,56 @@ class SimulationVisualizer:
 
             saved.append(self._save(fig, f"{_slugify(group_name)}_comparison.png"))
 
+        return saved
+
+    def plot_chunk_sweep_focus(self, results_path: str) -> List[Path]:
+        results = _load_json(results_path)
+        chunk_results = [item for item in results if item["name"].startswith("Chunk Size Granularity:")]
+        if not chunk_results:
+            return []
+
+        def _chunk_key(item):
+            return int(float(item["name"].split(":", 1)[1]))
+
+        chunk_results = sorted(chunk_results, key=_chunk_key)
+        chunk_sizes = [_chunk_key(item) for item in chunk_results]
+        throughput = [item["metrics"]["throughput_tokens_per_sec"] for item in chunk_results]
+        latency = [item["metrics"]["avg_request_latency_sec"] for item in chunk_results]
+        speedup = [(item.get("delta_vs_baseline") or {}).get("throughput_speedup", 1.0) for item in chunk_results]
+        queue_wait = [item["metrics"]["avg_queue_wait_sec"] for item in chunk_results]
+        stability = [item["metrics"]["stability_ratio"] for item in chunk_results]
+
+        saved: List[Path] = []
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        axes = axes.flatten()
+
+        axes[0].plot(chunk_sizes, throughput, marker="o", linewidth=2)
+        axes[0].set_title("Chunk Size vs Throughput")
+        axes[0].set_xlabel("Chunk size")
+        axes[0].set_ylabel("Committed tokens / sec")
+        axes[0].grid(alpha=0.3)
+
+        axes[1].plot(chunk_sizes, latency, marker="o", linewidth=2, color="tab:red")
+        axes[1].set_title("Chunk Size vs Average Latency")
+        axes[1].set_xlabel("Chunk size")
+        axes[1].set_ylabel("Seconds")
+        axes[1].grid(alpha=0.3)
+
+        axes[2].plot(chunk_sizes, speedup, marker="o", linewidth=2, color="tab:purple")
+        axes[2].axhline(1.0, linestyle="--", color="gray", linewidth=1)
+        axes[2].set_title("Chunk Size vs Speedup over No-SD Baseline")
+        axes[2].set_xlabel("Chunk size")
+        axes[2].set_ylabel("Speedup")
+        axes[2].grid(alpha=0.3)
+
+        axes[3].plot(chunk_sizes, queue_wait, marker="o", linewidth=2, color="tab:green", label="queue wait")
+        axes[3].plot(chunk_sizes, stability, marker="x", linewidth=2, color="tab:orange", label="stability")
+        axes[3].set_title("Chunk Size vs Queueing Pressure")
+        axes[3].set_xlabel("Chunk size")
+        axes[3].legend()
+        axes[3].grid(alpha=0.3)
+
+        saved.append(self._save(fig, "chunk_size_focus_dashboard.png"))
         return saved
 
     def plot_summary_vs_baseline(self, results_path: str) -> Path:
@@ -255,6 +306,7 @@ def main() -> None:
 
     if args.results_json:
         saved.extend(visualizer.plot_experiment_comparisons(args.results_json))
+        saved.extend(visualizer.plot_chunk_sweep_focus(args.results_json))
         saved.append(visualizer.plot_summary_vs_baseline(args.results_json))
     if args.window_json:
         saved.extend(visualizer.plot_window_timeseries(args.window_json, prefix=args.prefix))

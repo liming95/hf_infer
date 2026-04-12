@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -220,7 +221,26 @@ class ExperimentRunner:
         print(f"\nSaved results to {filename}")
 
     def save_markdown_report(self, filename: str = "sim_report.md") -> None:
-        lines = ["# Simulation Report", ""]
+        lines = [
+            "# Simulation Report",
+            "",
+            "## Metric Guide",
+            "",
+            "- `throughput_tokens_per_sec`: system-level committed token throughput. Higher is better.",
+            "- `avg_request_latency_sec`: average end-to-end request latency. Lower is better.",
+            "- `p95_request_latency_sec`: tail latency. This is often more important than average latency.",
+            "- `stability_ratio`: completed_requests / arrived_requests. Lower means the system is falling behind.",
+            "- `avg_queue_wait_sec`: average waiting time before admission. Higher means scheduling pressure.",
+            "- `peak_kv_utilization`: peak KV memory pressure. Near saturation means the scheduler is constrained by memory.",
+            "- `throughput_speedup`: SD throughput divided by baseline throughput. Above 1 means SD helps.",
+            "",
+            "## How To Read The Results",
+            "",
+            "- If `throughput_speedup > 1` and latency does not grow too much, SD is helping.",
+            "- If `throughput_speedup` is near 1 but latency or queue wait increases, SD is likely not worth it.",
+            "- If `stability_ratio` drops or `peak_kv_utilization` rises sharply, SD may be hurting scheduling quality.",
+            "",
+        ]
         for result in self.results:
             metrics = result["metrics"]
             lines.append(f"## {result['name']}")
@@ -255,6 +275,46 @@ class ExperimentRunner:
             lines.append("")
         Path(filename).write_text("\n".join(lines), encoding="utf-8")
         print(f"Saved markdown report to {filename}")
+
+    def save_csv_summary(self, filename: str = "sim_summary.csv") -> None:
+        header = [
+            "name",
+            "chunk_size",
+            "accept_rate",
+            "arrival_rate",
+            "batch_size",
+            "throughput_tokens_per_sec",
+            "avg_request_latency_sec",
+            "p95_request_latency_sec",
+            "avg_queue_wait_sec",
+            "stability_ratio",
+            "peak_kv_utilization",
+            "throughput_speedup",
+            "latency_change_pct",
+        ]
+        rows = [",".join(header)]
+        for result in self.results:
+            config = result["config"]
+            metrics = result["metrics"]
+            delta = result.get("delta_vs_baseline") or {}
+            values = [
+                result["name"],
+                str(config["chunk_size"]),
+                str(config["avg_accept_rate"]),
+                str(config["arrival_rate"]),
+                str(config["max_batch_size"]),
+                f"{metrics['throughput_tokens_per_sec']:.6f}",
+                f"{metrics['avg_request_latency_sec']:.6f}",
+                f"{metrics['p95_request_latency_sec']:.6f}",
+                f"{metrics['avg_queue_wait_sec']:.6f}",
+                f"{metrics['stability_ratio']:.6f}",
+                f"{metrics['peak_kv_utilization']:.6f}",
+                f"{delta.get('throughput_speedup', 0.0):.6f}",
+                f"{delta.get('latency_change_pct', 0.0):.6f}",
+            ]
+            rows.append(",".join(values))
+        Path(filename).write_text("\n".join(rows), encoding="utf-8")
+        print(f"Saved CSV summary to {filename}")
 
 
 def baseline_comparison(duration: float = 25.0) -> Dict[str, Dict]:
@@ -303,16 +363,81 @@ def baseline_comparison(duration: float = 25.0) -> Dict[str, Dict]:
     }
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run experiment sweeps for the async rollout simulator.")
+    parser.add_argument(
+        "--suite",
+        default="all",
+        choices=["all", "accept", "batch", "chunk", "arrival", "stability"],
+    )
+    parser.add_argument("--duration", type=float, default=25.0)
+    parser.add_argument("--output-json", default="sim_results.json")
+    parser.add_argument("--output-md", default="sim_report.md")
+    parser.add_argument("--output-csv", default="sim_summary.csv")
+    parser.add_argument("--use-real-compute", action="store_true")
+    parser.add_argument("--model")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--arrival-rate", type=float, default=10.0)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-concurrent", type=int, default=48)
+    parser.add_argument("--accept-rate", type=float, default=0.85)
+    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "mixed"])
+    return parser
+
+
+def _override_runner_configs(runner: ExperimentRunner, args) -> None:
+    original_baseline = runner._baseline_from_config
+
+    def wrapped_baseline(config: SystemConfig) -> SystemConfig:
+        cfg = original_baseline(config)
+        cfg.use_real_compute = args.use_real_compute
+        cfg.model_name_or_path = args.model
+        cfg.real_compute_device = args.device
+        cfg.real_compute_dtype = args.dtype
+        return cfg
+
+    runner._baseline_from_config = wrapped_baseline
+
+
 def main() -> None:
+    args = build_parser().parse_args()
     runner = ExperimentRunner(seed=42)
-    runner.run_sweep_accept_rate()
-    runner.run_sweep_batch_size()
-    runner.run_sweep_chunk_size()
-    runner.run_sweep_arrival_rate()
-    runner.run_stability_boundary()
-    baseline_comparison()
-    runner.save_results()
-    runner.save_markdown_report()
+    _override_runner_configs(runner, args)
+
+    if args.suite in ("all", "accept"):
+        runner.run_sweep_accept_rate(duration=args.duration)
+    if args.suite in ("all", "batch"):
+        runner.run_sweep_batch_size(duration=args.duration)
+    if args.suite in ("all", "chunk"):
+        runner._run_sweep(
+            "Chunk Size Granularity",
+            [1, 2, 4, 8],
+            lambda cs: SystemConfig(
+                arrival_rate=args.arrival_rate,
+                max_batch_size=args.batch_size,
+                max_concurrent_requests=args.max_concurrent,
+                chunk_size=cs,
+                avg_accept_rate=args.accept_rate,
+                enable_speculative=cs > 1,
+                workload_mode=args.workload_mode,
+                use_real_compute=args.use_real_compute,
+                model_name_or_path=args.model,
+                real_compute_device=args.device,
+                real_compute_dtype=args.dtype,
+            ),
+            args.duration,
+        )
+    if args.suite in ("all", "arrival"):
+        runner.run_sweep_arrival_rate(duration=args.duration)
+    if args.suite in ("all", "stability"):
+        runner.run_stability_boundary(duration=args.duration)
+    if args.suite == "all":
+        baseline_comparison(duration=args.duration)
+
+    runner.save_results(args.output_json)
+    runner.save_markdown_report(args.output_md)
+    runner.save_csv_summary(args.output_csv)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,10 @@ modifying a full serving stack.
 - [experiments.py](d:/phd/git/hf_infer/sim/experiments.py)
   Parameter sweeps for quick trend analysis.
 
+- [visualizer.py](d:/phd/git/hf_infer/sim/visualizer.py)
+  Post-processing plotting tool. Reads saved raw JSON outputs and generates
+  comparison plots and time-series plots while preserving the original data.
+
 - [quickstart.py](d:/phd/git/hf_infer/sim/quickstart.py)
   A few preset scenarios.
 
@@ -182,6 +186,8 @@ The simulator reports system metrics such as:
 - `avg_batch_size`
 - `draft_acceptance_rate`
 - `fallback_share`
+- per-step `step_traces`
+- windowed time-series metrics via `get_windowed_metrics()`
 
 When compute is executed online with HF, it also reports:
 
@@ -195,6 +201,26 @@ When compute is executed online with HF, it also reports:
 
 ```bash
 python sim/run_online.py --duration 20 --workload-mode mixed
+```
+
+Export summary + per-step trace + windowed metrics:
+
+```bash
+python sim/run_online.py ^
+  --duration 20 ^
+  --output-json sim/run_summary.json ^
+  --output-trace-json sim/step_trace.json ^
+  --output-window-json sim/window_metrics.json
+```
+
+Generate plots from those raw files:
+
+```bash
+python sim/visualizer.py ^
+  --window-json sim/window_metrics.json ^
+  --trace-json sim/step_trace.json ^
+  --output-dir sim/plots ^
+  --prefix rollout_run
 ```
 
 ### Async Rollout Style Traffic
@@ -301,6 +327,19 @@ Compare:
 - small vs large `chunk_size`
 - low vs high arrival pressure
 - poisson vs rollout-burst workloads
+
+The experiment runner now stores, for each condition:
+
+- final summary metrics
+- per-window time-series aggregates
+- baseline metrics from `SD off`
+- `delta_vs_baseline` fields such as throughput speedup and latency change
+
+And you can generate aggregate comparison figures from the saved experiment file:
+
+```bash
+python sim/visualizer.py --results-json sim_results.json --output-dir sim/plots
+```
 
 This is where you should look for:
 

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Iterable, List
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
 from simulator import BatchSDSimulator, SystemConfig
 
@@ -15,9 +16,25 @@ class ExperimentRunner:
         self.seed = seed
         self.results: List[Dict] = []
 
-    def run_experiment(self, name: str, config: SystemConfig, duration: float = 30.0) -> Dict:
+    def run_experiment(
+        self,
+        name: str,
+        config: SystemConfig,
+        duration: float = 30.0,
+        baseline_config: Optional[SystemConfig] = None,
+        window_sec: float = 1.0,
+    ) -> Dict:
         simulator = BatchSDSimulator(config, seed=self.seed)
         summary = simulator.run_simulation(duration_seconds=duration, verbose=False)
+        windowed_metrics = simulator.get_windowed_metrics(window_sec=window_sec)
+        baseline_summary = None
+        deltas = None
+        if baseline_config is not None:
+            baseline_summary = BatchSDSimulator(baseline_config, seed=self.seed).run_simulation(
+                duration_seconds=duration,
+                verbose=False,
+            )
+            deltas = self._build_delta(summary, baseline_summary)
         result = {
             "name": name,
             "duration": duration,
@@ -31,9 +48,33 @@ class ExperimentRunner:
                 "enable_speculative": config.enable_speculative,
             },
             "metrics": summary,
+            "windowed_metrics": windowed_metrics,
+            "baseline_metrics": baseline_summary,
+            "delta_vs_baseline": deltas,
         }
         self.results.append(result)
         return result
+
+    def _build_delta(self, metrics: Dict, baseline_metrics: Dict) -> Dict[str, float]:
+        def pct_change(key: str) -> float:
+            base = baseline_metrics.get(key, 0.0)
+            current = metrics.get(key, 0.0)
+            if abs(base) < 1e-9:
+                return 0.0
+            return (current - base) / base
+
+        return {
+            "throughput_speedup": (
+                metrics["throughput_tokens_per_sec"] / baseline_metrics["throughput_tokens_per_sec"]
+                if baseline_metrics["throughput_tokens_per_sec"] > 0
+                else 0.0
+            ),
+            "latency_change_pct": pct_change("avg_request_latency_sec"),
+            "p95_latency_change_pct": pct_change("p95_request_latency_sec"),
+            "queue_wait_change_pct": pct_change("avg_queue_wait_sec"),
+            "stability_change_pct": pct_change("stability_ratio"),
+            "kv_peak_change_pct": pct_change("peak_kv_utilization"),
+        }
 
     def _run_sweep(
         self,
@@ -49,16 +90,43 @@ class ExperimentRunner:
         results: List[Dict] = []
         for value in values:
             config = config_builder(value)
-            result = self.run_experiment(f"{title}:{value}", config, duration)
+            baseline_config = self._baseline_from_config(config)
+            result = self.run_experiment(
+                f"{title}:{value}",
+                config,
+                duration,
+                baseline_config=baseline_config,
+            )
             metrics = result["metrics"]
+            delta = result["delta_vs_baseline"] or {}
             results.append(result)
             print(
                 f"value={value} throughput={metrics['throughput_tokens_per_sec']:.2f} "
                 f"lat={metrics['avg_request_latency_sec']:.3f}s "
                 f"stability={metrics['stability_ratio']:.2%} "
-                f"peak_kv={metrics['peak_kv_utilization']:.1f}%"
+                f"peak_kv={metrics['peak_kv_utilization']:.1f}% "
+                f"speedup={delta.get('throughput_speedup', 0.0):.2f}x"
             )
         return results
+
+    def _baseline_from_config(self, config: SystemConfig) -> SystemConfig:
+        return SystemConfig(
+            arrival_rate=config.arrival_rate,
+            max_batch_size=config.max_batch_size,
+            max_concurrent_requests=config.max_concurrent_requests,
+            chunk_size=1,
+            avg_accept_rate=1.0,
+            workload_mode=config.workload_mode,
+            rollout_burst_size=config.rollout_burst_size,
+            gpu_memory_mb=config.gpu_memory_mb,
+            page_size=config.page_size,
+            enable_speculative=False,
+            benchmark_table_path=config.benchmark_table_path,
+            use_real_compute=config.use_real_compute,
+            model_name_or_path=config.model_name_or_path,
+            real_compute_device=config.real_compute_device,
+            real_compute_dtype=config.real_compute_dtype,
+        )
 
     def run_sweep_accept_rate(self, duration: float = 25.0) -> List[Dict]:
         return self._run_sweep(
@@ -151,6 +219,43 @@ class ExperimentRunner:
             json.dump(self.results, handle, indent=2)
         print(f"\nSaved results to {filename}")
 
+    def save_markdown_report(self, filename: str = "sim_report.md") -> None:
+        lines = ["# Simulation Report", ""]
+        for result in self.results:
+            metrics = result["metrics"]
+            lines.append(f"## {result['name']}")
+            lines.append("")
+            lines.append(f"- Throughput: {metrics['throughput_tokens_per_sec']:.2f} tokens/sec")
+            lines.append(f"- Avg latency: {metrics['avg_request_latency_sec']:.3f}s")
+            lines.append(f"- P95 latency: {metrics['p95_request_latency_sec']:.3f}s")
+            lines.append(f"- Stability: {metrics['stability_ratio']:.2%}")
+            lines.append(f"- Peak KV: {metrics['peak_kv_utilization']:.2f}%")
+            if result.get("delta_vs_baseline"):
+                delta = result["delta_vs_baseline"]
+                lines.append(f"- Baseline throughput speedup: {delta['throughput_speedup']:.2f}x")
+                lines.append(f"- Baseline avg latency change: {delta['latency_change_pct']:.2%}")
+                lines.append(f"- Baseline queue wait change: {delta['queue_wait_change_pct']:.2%}")
+            if result.get("windowed_metrics"):
+                peak_window = max(
+                    result["windowed_metrics"],
+                    key=lambda item: item["throughput_tokens_per_sec"],
+                )
+                worst_queue = max(
+                    result["windowed_metrics"],
+                    key=lambda item: item["avg_queue_size"],
+                )
+                lines.append(
+                    f"- Peak window throughput: {peak_window['throughput_tokens_per_sec']:.2f} tokens/sec "
+                    f"at [{peak_window['window_start']:.1f}, {peak_window['window_end']:.1f}]s"
+                )
+                lines.append(
+                    f"- Worst queue window: avg queue {worst_queue['avg_queue_size']:.2f} "
+                    f"at [{worst_queue['window_start']:.1f}, {worst_queue['window_end']:.1f}]s"
+                )
+            lines.append("")
+        Path(filename).write_text("\n".join(lines), encoding="utf-8")
+        print(f"Saved markdown report to {filename}")
+
 
 def baseline_comparison(duration: float = 25.0) -> Dict[str, Dict]:
     print("\n" + "=" * 80)
@@ -207,6 +312,7 @@ def main() -> None:
     runner.run_stability_boundary()
     baseline_comparison()
     runner.save_results()
+    runner.save_markdown_report()
 
 
 if __name__ == "__main__":

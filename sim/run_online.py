@@ -25,6 +25,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--benchmark-table-path")
     parser.add_argument("--disable-speculative", action="store_true")
+    parser.add_argument("--window-sec", type=float, default=1.0)
+    parser.add_argument("--output-json")
+    parser.add_argument("--output-trace-json")
+    parser.add_argument("--output-window-json")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -47,11 +51,22 @@ def main() -> None:
         real_compute_device=args.device,
         real_compute_dtype=args.dtype,
     )
-    summary = BatchSDSimulator(config, seed=42).run_simulation(
-        duration_seconds=args.duration,
-        verbose=args.verbose,
-    )
-    print(json.dumps(summary, indent=2))
+    simulator = BatchSDSimulator(config, seed=42)
+    summary = simulator.run_simulation(duration_seconds=args.duration, verbose=args.verbose)
+    windowed_metrics = simulator.get_windowed_metrics(window_sec=args.window_sec)
+    payload = {
+        "summary": summary,
+        "windowed_metrics": windowed_metrics,
+    }
+    if args.output_json:
+        with open(args.output_json, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    if args.output_trace_json:
+        simulator.export_step_traces(args.output_trace_json)
+    if args.output_window_json:
+        with open(args.output_window_json, "w", encoding="utf-8") as handle:
+            json.dump(windowed_metrics, handle, indent=2)
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

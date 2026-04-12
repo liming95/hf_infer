@@ -17,7 +17,7 @@ import math
 import os
 import random
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from statistics import mean
 from typing import Deque, Dict, List, Optional
 
@@ -62,6 +62,37 @@ class Request:
         if self.completed_time is None:
             return 0.0
         return self.completed_time - self.arrival_time
+
+
+@dataclass
+class StepTrace:
+    """Per-step execution trace for temporal analysis."""
+
+    step_id: int
+    start_time: float
+    end_time: float
+    batch_size: int
+    prefill_batch_size: int
+    decode_batch_size: int
+    verify_width: float
+    queued_requests: int
+    active_requests: int
+    kv_utilization: float
+    peak_kv_utilization: float
+    prefill_latency_ms: float
+    decode_latency_ms: float
+    total_latency_ms: float
+    draft_tokens: int
+    accepted_draft_tokens: int
+    rejected_draft_tokens: int
+    fallback_tokens: int
+    committed_tokens: int
+    avg_seq_len: float
+    avg_prompt_len: float
+    executor_mode: str
+    memory_allocated_mb: float = 0.0
+    peak_memory_allocated_mb: float = 0.0
+    gpu_utilization: float = 0.0
 
 
 @dataclass
@@ -464,6 +495,7 @@ class BatchSDSimulator:
         self.batch_size_trace: List[int] = []
         self.queue_size_trace: List[int] = []
         self.execution_trace: List[ExecutionMetrics] = []
+        self.step_traces: List[StepTrace] = []
 
     def _build_executor(self):
         if self.config.use_real_compute:
@@ -527,6 +559,7 @@ class BatchSDSimulator:
             self.total_admitted_requests += 1
 
     def _process_batch(self, batch: List[Request], verbose: bool) -> float:
+        step_start_time = self.current_time
         self.total_batches += 1
         self.total_compute_steps += 1
         self.total_batch_size_acc += len(batch)
@@ -588,6 +621,7 @@ class BatchSDSimulator:
 
         batch_latency_ms = prefill_latency_ms + decode_latency_ms
         self.total_compute_time_ms += batch_latency_ms
+        step_end_time = self.current_time + batch_latency_ms / 1000.0
 
         if decode_requests:
             if decode_metrics.gpu_utilization is not None:
@@ -605,6 +639,13 @@ class BatchSDSimulator:
                 self.utilization_samples.append(
                     self.compute_model.estimate_gpu_utilization(len(prefill_requests), avg_prompt, 1.0)
                 )
+
+        step_gpu_utilization = self.utilization_samples[-1] if self.utilization_samples else 0.0
+        step_memory_allocated_mb = max(prefill_metrics.memory_allocated_mb, decode_metrics.memory_allocated_mb)
+        step_peak_memory_allocated_mb = max(
+            prefill_metrics.max_memory_allocated_mb,
+            decode_metrics.max_memory_allocated_mb,
+        )
 
         completed_now: List[Request] = []
         for request in batch:
@@ -625,7 +666,96 @@ class BatchSDSimulator:
                     f"latency={request.end_to_end_latency():.3f}s"
                 )
 
+        self.step_traces.append(
+            StepTrace(
+                step_id=self.total_compute_steps,
+                start_time=step_start_time,
+                end_time=step_end_time,
+                batch_size=len(batch),
+                prefill_batch_size=len(prefill_requests),
+                decode_batch_size=len(decode_requests),
+                verify_width=verify_width,
+                queued_requests=len(self.waiting_requests),
+                active_requests=len(self.active_requests),
+                kv_utilization=self.kv_manager.get_utilization(),
+                peak_kv_utilization=self.kv_manager.get_peak_utilization(),
+                prefill_latency_ms=prefill_latency_ms,
+                decode_latency_ms=decode_latency_ms,
+                total_latency_ms=batch_latency_ms,
+                draft_tokens=self.total_tokens_generated,
+                accepted_draft_tokens=self.total_tokens_accepted,
+                rejected_draft_tokens=self.total_rejected_tokens,
+                fallback_tokens=self.total_fallback_tokens,
+                committed_tokens=self.total_completed_tokens,
+                avg_seq_len=float(mean([r.current_seq_len for r in batch])) if batch else 0.0,
+                avg_prompt_len=float(mean([r.prompt_len for r in prefill_requests])) if prefill_requests else 0.0,
+                executor_mode="real_hf" if self.config.use_real_compute else "proxy",
+                memory_allocated_mb=step_memory_allocated_mb,
+                peak_memory_allocated_mb=step_peak_memory_allocated_mb,
+                gpu_utilization=step_gpu_utilization,
+            )
+        )
+
         return max(batch_latency_ms, 0.05)
+
+    def export_step_traces(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([asdict(item) for item in self.step_traces], handle, indent=2)
+
+    def _counter_delta(self, traces: List[StepTrace], field_name: str) -> float:
+        if not traces:
+            return 0.0
+        previous_value = 0.0
+        first_index = self.step_traces.index(traces[0])
+        if first_index > 0:
+            previous_value = getattr(self.step_traces[first_index - 1], field_name)
+        end_value = getattr(traces[-1], field_name)
+        return float(end_value - previous_value)
+
+    def get_windowed_metrics(self, window_sec: float = 1.0) -> List[Dict[str, float]]:
+        if not self.step_traces:
+            return []
+
+        max_time = max(trace.end_time for trace in self.step_traces)
+        window_start = 0.0
+        windows: List[Dict[str, float]] = []
+
+        while window_start < max_time + 1e-9:
+            window_end = window_start + window_sec
+            traces = [
+                trace
+                for trace in self.step_traces
+                if trace.end_time > window_start and trace.start_time <= window_end
+            ]
+            if traces:
+                duration = max(window_end - window_start, 1e-9)
+                windows.append(
+                    {
+                        "window_start": window_start,
+                        "window_end": window_end,
+                        "steps": len(traces),
+                        "avg_batch_size": float(np.mean([trace.batch_size for trace in traces])),
+                        "avg_prefill_batch_size": float(np.mean([trace.prefill_batch_size for trace in traces])),
+                        "avg_decode_batch_size": float(np.mean([trace.decode_batch_size for trace in traces])),
+                        "avg_queue_size": float(np.mean([trace.queued_requests for trace in traces])),
+                        "avg_active_requests": float(np.mean([trace.active_requests for trace in traces])),
+                        "avg_kv_utilization": float(np.mean([trace.kv_utilization for trace in traces])),
+                        "peak_kv_utilization": float(max(trace.peak_kv_utilization for trace in traces)),
+                        "avg_step_latency_ms": float(np.mean([trace.total_latency_ms for trace in traces])),
+                        "avg_prefill_latency_ms": float(np.mean([trace.prefill_latency_ms for trace in traces])),
+                        "avg_decode_latency_ms": float(np.mean([trace.decode_latency_ms for trace in traces])),
+                        "throughput_tokens_per_sec": self._counter_delta(traces, "committed_tokens") / duration,
+                        "accepted_tokens_per_sec": self._counter_delta(traces, "accepted_draft_tokens") / duration,
+                        "rejected_tokens_per_sec": self._counter_delta(traces, "rejected_draft_tokens") / duration,
+                        "fallback_tokens_per_sec": self._counter_delta(traces, "fallback_tokens") / duration,
+                        "avg_gpu_utilization": float(np.mean([trace.gpu_utilization for trace in traces])),
+                        "avg_memory_allocated_mb": float(np.mean([trace.memory_allocated_mb for trace in traces])),
+                        "peak_memory_allocated_mb": float(max(trace.peak_memory_allocated_mb for trace in traces)),
+                    }
+                )
+            window_start = window_end
+
+        return windows
 
     def get_summary(self, duration_seconds: float) -> Dict[str, float]:
         completed_latencies = [r.end_to_end_latency() for r in self.completed_requests]

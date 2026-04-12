@@ -355,6 +355,20 @@ class TestSimulator(unittest.TestCase):
         self.assertGreaterEqual(sim.total_tokens_accepted, 0)
         self.assertIn("throughput_tokens_per_sec", summary)
         self.assertIn("peak_kv_utilization", summary)
+
+    def test_step_trace_and_window_metrics(self):
+        config = SystemConfig(
+            arrival_rate=5.0,
+            max_batch_size=8,
+        )
+        sim = BatchSDSimulator(config, seed=42)
+        sim.run_simulation(duration_seconds=2.0)
+        windows = sim.get_windowed_metrics(window_sec=0.5)
+
+        self.assertGreater(len(sim.step_traces), 0)
+        self.assertGreater(len(windows), 0)
+        self.assertIn("throughput_tokens_per_sec", windows[0])
+        self.assertIn("avg_queue_size", windows[0])
     
     def test_non_speculative_mode(self):
         config = SystemConfig(

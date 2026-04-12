@@ -5,3 +5,7 @@ pytest
 
 # core engine
 sd_core -> hf_tool -> candidate_generator
+
+# simulator
+See `sim/README_SIMULATOR.md` for the async rollout + speculative decoding
+online simulator, including the real HF compute mode.

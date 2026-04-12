@@ -23,6 +23,8 @@ from typing import Deque, Dict, List, Optional
 
 import numpy as np
 
+from executor import ExecutionMetrics, HFRealExecutor, ProxyExecutor
+
 
 @dataclass
 class Request:
@@ -90,6 +92,10 @@ class SystemConfig:
     rollout_burst_size: int = 8
     long_request_ratio: float = 0.2
     benchmark_table_path: Optional[str] = None
+    use_real_compute: bool = False
+    model_name_or_path: Optional[str] = None
+    real_compute_device: str = "cuda"
+    real_compute_dtype: str = "float16"
 
     enable_speculative: bool = True
     verify_parallelism: float = 0.32
@@ -282,11 +288,16 @@ class ComputeModel:
     def estimate_prefill_latency(self, requests: List[Request]) -> float:
         if not requests:
             return 0.0
-        total_prompt_tokens = sum(r.prompt_len for r in requests)
-        measured = self._nearest_prefill_latency(len(requests), total_prompt_tokens)
+        return self.estimate_prefill_latency_from_lengths([r.prompt_len for r in requests])
+
+    def estimate_prefill_latency_from_lengths(self, prompt_lengths: List[int]) -> float:
+        if not prompt_lengths:
+            return 0.0
+        total_prompt_tokens = sum(prompt_lengths)
+        measured = self._nearest_prefill_latency(len(prompt_lengths), total_prompt_tokens)
         if measured is not None:
             return measured
-        batch_gain = math.sqrt(len(requests))
+        batch_gain = math.sqrt(len(prompt_lengths))
         latency = (
             self.config.scheduler_overhead_ms
             + self.config.batch_overhead_ms
@@ -297,9 +308,13 @@ class ComputeModel:
     def estimate_decode_latency(self, requests: List[Request], verify_width: float) -> float:
         if not requests:
             return 0.0
+        return self.estimate_decode_latency_from_lengths([r.current_seq_len for r in requests], verify_width)
 
-        batch_size = len(requests)
-        avg_seq_len = mean(r.current_seq_len for r in requests)
+    def estimate_decode_latency_from_lengths(self, seq_lengths: List[int], verify_width: float) -> float:
+        if not seq_lengths:
+            return 0.0
+        batch_size = len(seq_lengths)
+        avg_seq_len = mean(seq_lengths)
         measured = self._nearest_decode_latency(batch_size, avg_seq_len, verify_width)
         if measured is not None:
             return measured
@@ -424,6 +439,7 @@ class BatchSDSimulator:
         self.scheduler = BatchScheduler(config, self.kv_manager)
         self.compute_model = ComputeModel(config)
         self.sd_accepter = SDAccepter(seed)
+        self.executor = self._build_executor()
 
         self.current_time = 0.0
         self.waiting_requests: Deque[Request] = deque()
@@ -447,6 +463,18 @@ class BatchSDSimulator:
         self.utilization_samples: List[float] = []
         self.batch_size_trace: List[int] = []
         self.queue_size_trace: List[int] = []
+        self.execution_trace: List[ExecutionMetrics] = []
+
+    def _build_executor(self):
+        if self.config.use_real_compute:
+            if not self.config.model_name_or_path:
+                raise ValueError("model_name_or_path must be set when use_real_compute=True")
+            return HFRealExecutor(
+                model_name_or_path=self.config.model_name_or_path,
+                device=self.config.real_compute_device,
+                dtype=self.config.real_compute_dtype,
+            )
+        return ProxyExecutor(self.compute_model)
 
     def run_simulation(self, duration_seconds: float = 60.0, verbose: bool = False) -> Dict[str, float]:
         next_arrival_time = self.request_gen.next_arrival_time(0.0)
@@ -507,9 +535,11 @@ class BatchSDSimulator:
         prefill_requests = [r for r in batch if not r.prefill_done]
         decode_requests = [r for r in batch if r.prefill_done and not r.is_completed()]
 
-        prefill_latency_ms = self.compute_model.estimate_prefill_latency(prefill_requests)
+        prefill_metrics = self.executor.prefill([r.prompt_len for r in prefill_requests])
+        prefill_latency_ms = prefill_metrics.latency_ms
         if prefill_requests:
             self.total_prefill_time_ms += prefill_latency_ms
+            self.execution_trace.append(prefill_metrics)
             for request in prefill_requests:
                 request.prefill_done = True
                 if request.decode_start_time is None:
@@ -521,8 +551,11 @@ class BatchSDSimulator:
                 min(r.remaining_tokens(), max(1, self.config.chunk_size))
                 for r in decode_requests
             )
-        decode_latency_ms = self.compute_model.estimate_decode_latency(decode_requests, verify_width)
+        decode_metrics = self.executor.decode([r.current_seq_len for r in decode_requests], max(1, int(round(verify_width))))
+        decode_latency_ms = decode_metrics.latency_ms
         self.total_decode_time_ms += decode_latency_ms
+        if decode_requests:
+            self.execution_trace.append(decode_metrics)
 
         for request in decode_requests:
             remaining = request.remaining_tokens()
@@ -557,15 +590,21 @@ class BatchSDSimulator:
         self.total_compute_time_ms += batch_latency_ms
 
         if decode_requests:
-            avg_seq_len = mean(r.current_seq_len for r in decode_requests)
-            self.utilization_samples.append(
-                self.compute_model.estimate_gpu_utilization(len(decode_requests), avg_seq_len, verify_width)
-            )
+            if decode_metrics.gpu_utilization is not None:
+                self.utilization_samples.append(decode_metrics.gpu_utilization)
+            else:
+                avg_seq_len = mean(r.current_seq_len for r in decode_requests)
+                self.utilization_samples.append(
+                    self.compute_model.estimate_gpu_utilization(len(decode_requests), avg_seq_len, verify_width)
+                )
         elif prefill_requests:
-            avg_prompt = mean(r.prompt_len for r in prefill_requests)
-            self.utilization_samples.append(
-                self.compute_model.estimate_gpu_utilization(len(prefill_requests), avg_prompt, 1.0)
-            )
+            if prefill_metrics.gpu_utilization is not None:
+                self.utilization_samples.append(prefill_metrics.gpu_utilization)
+            else:
+                avg_prompt = mean(r.prompt_len for r in prefill_requests)
+                self.utilization_samples.append(
+                    self.compute_model.estimate_gpu_utilization(len(prefill_requests), avg_prompt, 1.0)
+                )
 
         completed_now: List[Request] = []
         for request in batch:
@@ -638,6 +677,14 @@ class BatchSDSimulator:
             "peak_kv_utilization": self.kv_manager.get_peak_utilization(),
             "final_kv_utilization": self.kv_manager.get_utilization(),
             "avg_gpu_utilization": float(np.mean(self.utilization_samples)) if self.utilization_samples else 0.0,
+            "avg_step_memory_allocated_mb": float(
+                np.mean([m.memory_allocated_mb for m in self.execution_trace])
+            ) if self.execution_trace else 0.0,
+            "peak_step_memory_allocated_mb": max(
+                [m.max_memory_allocated_mb for m in self.execution_trace],
+                default=0.0,
+            ),
+            "executor_mode": "real_hf" if self.config.use_real_compute else "proxy",
             "stability_ratio": len(self.completed_requests) / max(self.total_arrived_requests, 1),
             "queue_backlog_ratio": len(self.waiting_requests) / max(self.total_arrived_requests, 1),
         }

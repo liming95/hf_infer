@@ -1,344 +1,395 @@
-# Batch Request + Speculative Decoding (SD) Rollout Simulator
+# Async Rollout + Speculative Decoding Online Simulator
 
-A comprehensive discrete-event simulator for modeling LLM serving systems with dynamic batching and speculative decoding. This simulator helps research and understand the performance characteristics of batch serving with SD token acceptance strategy.
+This directory contains an experiment harness for studying speculative decoding
+in an asynchronous RLHF-style rollout workload.
 
-## Overview
+The key design choice is:
 
-This simulator models a queuing system with the following characteristics:
-- **Memory Constraint**: KV cache memory budget limits concurrent requests
-- **Probabilistic Rejection**: Speculative decoding with configurable acceptance rates
-- **Dynamic Batching**: Continuous batching scheduler selects requests based on available resources
-- **Discrete Time**: Event-driven simulation with configurable time steps
+- `workload`, `queueing`, `dynamic batching`, `KV admission`, and `accept/reject`
+  are simulated at the system level.
+- `compute` can be executed in two modes:
+  - `proxy`: lightweight analytical cost model for rapid iteration
+  - `real_hf`: real Hugging Face forward passes driven online by the scheduler
+
+The second mode is the important one for your use case: the scheduler decides
+the batch shape at each step, and that exact shape is then executed by HF so
+you can measure real latency and memory behavior during a dynamic scheduling
+process.
+
+## What This Simulator Is Trying To Answer
+
+The target question is not just:
+
+- "Does SD speed up one isolated decode call?"
+
+It is:
+
+- "When rollout requests arrive asynchronously and are packed by a dynamic
+  batching scheduler, what real system-level gains or regressions does SD
+  create?"
+
+Concretely, the simulator is intended to help answer:
+
+- Does SD improve end-to-end throughput under async rollout traffic?
+- How does SD change queue growth and stability under load?
+- When does a larger `chunk_size` help, and when does it hurt?
+- Under low acceptance, does SD create negative system-level returns?
+- How do KV pressure and dynamic batching interact with SD?
+- What happens to tail latency and backlog as load increases?
+
+## What Is Simulated vs What Is Real
+
+### Simulated
+
+- request arrivals
+- prompt length / generation length distributions
+- rollout-burst style asynchronous traffic
+- scheduler logic
+- KV cache accounting
+- acceptance / rejection outcomes
+- request lifecycle transitions
+
+### Real when `use_real_compute=True`
+
+- HF `prefill` forward cost for the scheduled batch shape
+- HF `decode` forward cost for the scheduled batch shape
+- wall-clock latency per scheduling step
+- CUDA memory allocated / peak memory allocated / reserved memory
+
+### Important Limitation
+
+This simulator is **not** a drop-in replacement for vLLM internals.
+
+It approximates a vLLM-like serving loop, but the actual compute engine is HF.
+That means:
+
+- it is useful for validating whether SD introduces system-level performance
+  problems in this scenario
+- it is not a perfect prediction of production numbers from vLLM
+
+The simulator is best viewed as a fast, controllable experimental platform for
+finding trends, failure regions, and candidate explanations before building or
+modifying a full serving stack.
+
+## Core Files
+
+- [simulator.py](d:/phd/git/hf_infer/sim/simulator.py)
+  Main event loop. Owns requests, queue, scheduler, KV tracking, batch
+  processing, acceptance, and summary metrics.
+
+- [executor.py](d:/phd/git/hf_infer/sim/executor.py)
+  Compute backends.
+  `ProxyExecutor` is analytical.
+  `HFRealExecutor` executes real HF forwards online inside the scheduling loop.
+
+- [run_online.py](d:/phd/git/hf_infer/sim/run_online.py)
+  CLI entrypoint for running a single simulation with either proxy or real HF
+  compute.
+
+- [hardware_benchmark.py](d:/phd/git/hf_infer/sim/hardware_benchmark.py)
+  Offline shape benchmark utility. Useful if you want a calibrated proxy mode,
+  but it does **not** replace the online real compute mode.
+
+- [experiments.py](d:/phd/git/hf_infer/sim/experiments.py)
+  Parameter sweeps for quick trend analysis.
+
+- [quickstart.py](d:/phd/git/hf_infer/sim/quickstart.py)
+  A few preset scenarios.
+
+- [test_simulator.py](d:/phd/git/hf_infer/sim/test_simulator.py)
+  Tests for queueing, KV tracking, metrics, and benchmark-table fallback logic.
 
 ## System Architecture
 
-```
-┌─────────────────┐
-│ Request         │  Generates requests with:
-│ Generator       │  - Prompt length
-│                 │  - Max generation length
-│                 │  - Arrival time (Poisson process)
-│                 │  - SD accept rate
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Batch           │  Selects active requests:
-│ Scheduler       │  - Respects memory constraints
-│                 │  - Greedy: prioritize short jobs
-│                 │  - Max batch size limit
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Compute         │  Estimates:
-│ Model (HF       │  - Latency per compute step
-│ Proxy)          │  - Throughput
-│                 │  - GPU utilization
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ SD Accepter     │  Token acceptance logic:
-│                 │  - Accept tokens with probability
-│                 │  - Stop on rejection (normal SD behavior)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ KV Cache        │  Memory tracking:
-│ Manager         │  - Allocate cache for new requests
-│                 │  - Update on sequence growth
-│                 │  - Release on completion
-└────────┬────────┘
-         │
-         ▼
-    [Queue Update]
-```
+Each simulation step follows this loop:
 
-## Files
+1. `RequestGenerator` injects new rollout-like requests.
+2. Requests enter the waiting queue.
+3. `KVCacheManager` decides whether requests can be admitted.
+4. `BatchScheduler` forms the next batch from active requests.
+5. The chosen batch is executed:
+   - `prefill` for newly admitted requests
+   - `decode` for requests already in generation
+6. After compute, `SDAccepter` applies speculative accept/reject behavior.
+7. Request state, sequence length, and KV usage are updated.
+8. Completed requests are removed and memory is released.
+9. The event loop advances with the measured compute latency.
 
-### Core Simulator
-- **`simulator.py`**: Main simulation engine with all components
-  - `RequestGenerator`: Poisson arrival process
-  - `KVCacheManager`: Memory management with paging
-  - `ComputeModel`: Performance estimation for HF models
-  - `SDAccepter`: Token-level acceptance logic
-  - `BatchScheduler`: Request scheduling with constraints
-  - `BatchSDSimulator`: Main orchestrator
+This is the key property of the framework:
 
-### Experiments
-- **`experiments.py`**: Experiment runners for systematic evaluation
-  - Parameter sweeps (accept rate, batch size, chunk size, load)
-  - Baseline vs SD comparison
-  - Customizable experiment harness
+- scheduling and compute are in the same closed loop
 
-### Visualization
-- **`visualizer.py`**: Analysis and visualization tools
-  - Throughput curves
-  - Memory utilization plots
-  - Performance dashboards
-  - PNG export for reports
+That is what allows the simulator to expose system-level side effects such as:
 
-## Quick Start
+- larger chunk sizes increasing per-step cost
+- low acceptance creating wasted work and extra backlog
+- higher throughput reducing queueing delay
+- KV growth shifting the scheduler’s feasible batch composition over time
 
-### 1. Run Basic Simulation
+## Compute Modes
 
-```bash
-python simulator.py
-```
+### 1. Proxy Mode
 
-This runs a 30-second simulation with default parameters:
-- 10 requests/sec arrival rate
-- Batch size: 16
-- Chunk size: 4 (tokens per step)
-- SD accept rate: 0.85
+Use this when you want quick iteration and broad sweeps.
 
-Expected output:
-```
-Starting simulation for 30.0 seconds
-================================================================================
-[0.000s] Request 0 arrived (prompt=45, max_tokens=210, accept_rate=0.82)
-[0.000s] Request 1 arrived (prompt=52, max_tokens=195, accept_rate=0.87)
-...
-================================================================================
-SIMULATION SUMMARY
-================================================================================
-Completed Requests: 245
-Total Tokens Generated: 45230
-Total Tokens Accepted: 38445
-SD Acceptance Rate: 85.04%
-Overall Throughput: 1850.5 tokens/sec
-```
+Characteristics:
 
-### 2. Run Comprehensive Experiments
+- fast
+- no GPU dependency
+- good for logic validation and rough trends
+- not sufficient by itself for credible hardware conclusions
+
+### 2. Real HF Mode
+
+Use this when you want the scheduler to drive actual HF work online.
+
+Characteristics:
+
+- slower
+- requires `torch`, `transformers`, and a usable device
+- measures latency and CUDA memory inside the event loop
+- best mode for validating whether SD causes real regressions under dynamic
+  scheduling
+
+### How `HFRealExecutor` Works
+
+The executor uses the scheduler-selected batch shape each step:
+
+- `prefill`: batch size and padded prompt length
+- `decode`: batch size, padded sequence length, and chunk size
+
+The content itself is synthetic token IDs, because the goal is to study:
+
+- batching shape
+- KV growth
+- scheduling interaction
+- hardware cost
+
+This is intentional. For this workload study, shape and timing matter more than
+semantic correctness of tokens.
+
+## Metrics
+
+The simulator reports system metrics such as:
+
+- `throughput_tokens_per_sec`
+- `avg_request_latency_sec`
+- `p95_request_latency_sec`
+- `avg_queue_wait_sec`
+- `stability_ratio`
+- `queue_backlog_ratio`
+- `peak_kv_utilization`
+- `avg_batch_size`
+- `draft_acceptance_rate`
+- `fallback_share`
+
+When compute is executed online with HF, it also reports:
+
+- `avg_step_memory_allocated_mb`
+- `peak_step_memory_allocated_mb`
+- `executor_mode`
+
+## Example Usage
+
+### Quick Proxy Run
 
 ```bash
-python experiments.py
+python sim/run_online.py --duration 20 --workload-mode mixed
 ```
 
-This runs five experiment suites:
-1. **SD Speedup Curve**: Accept rate sweep (0.5 to 1.0)
-2. **Batch Size Impact**: Sweep batch sizes (4, 8, 16, 32)
-3. **Chunk Size Granularity**: Verify granularity tradeoffs
-4. **Load Impact**: Arrival rate sweep (5 to 40 req/sec)
-5. **Baseline Comparison**: With vs without SD
-
-### 3. Generate Visualizations
+### Async Rollout Style Traffic
 
 ```bash
-python visualizer.py
+python sim/run_online.py ^
+  --duration 30 ^
+  --workload-mode rollout_burst ^
+  --rollout-burst-size 12 ^
+  --arrival-rate 16 ^
+  --batch-size 16 ^
+  --chunk-size 4 ^
+  --accept-rate 0.85
 ```
 
-Generates performance dashboards and comparison plots (PNG format):
-- `throughput_vs_accept_rate.png`: SD quality impact
-- `batch_size_scaling.png`: Batch size scaling curves
-- `chunk_size_granularity.png`: Verification granularity tradeoff
-- `load_sensitivity.png`: System behavior under load
-- `memory_pressure.png`: KV cache utilization
-- `summary_dashboard.png`: Comprehensive dashboard
+### Real HF Online Compute
 
-## Configuration
-
-### System Parameters (SystemConfig)
-
-```python
-config = SystemConfig(
-    # Model configuration
-    model_hidden_size=1152,      # Qwen2.5-1.5B
-    num_layers=28,
-    
-    # Memory configuration
-    gpu_memory_mb=12000,          # Total GPU memory
-    model_weights_mb=3000,        # Model weights size
-    kv_budget_mb=6000,            # Available for KV cache (auto-calculated)
-    
-    # Batching configuration
-    max_batch_size=32,            # Max requests per batch
-    chunk_size=4,                 # Tokens per generation step
-    
-    # Workload configuration
-    arrival_rate=10.0,            # Requests per second
-    avg_prompt_len=50,            # Average prompt tokens
-    avg_max_tokens=200,           # Average generation length
-    avg_accept_rate=0.85,         # SD token acceptance rate
-)
+```bash
+python sim/run_online.py ^
+  --use-real-compute ^
+  --model /path/to/your/model ^
+  --device cuda ^
+  --dtype float16 ^
+  --duration 30 ^
+  --workload-mode rollout_burst ^
+  --arrival-rate 16 ^
+  --batch-size 16 ^
+  --max-concurrent 64 ^
+  --chunk-size 4 ^
+  --accept-rate 0.85 ^
+  --verbose
 ```
 
-### Custom Simulation
+### Disable Speculative Decoding for Baseline
 
-```python
-from simulator import BatchSDSimulator, SystemConfig
-
-# Create custom configuration
-config = SystemConfig(
-    arrival_rate=20.0,           # Higher load
-    max_batch_size=32,           # Larger batches
-    chunk_size=8,                # Larger chunk
-    avg_accept_rate=0.9,         # Better SD quality
-    gpu_memory_mb=20000,         # More memory
-)
-
-# Run simulation
-simulator = BatchSDSimulator(config, seed=42)
-simulator.run_simulation(duration_seconds=60.0)
+```bash
+python sim/run_online.py ^
+  --disable-speculative ^
+  --chunk-size 1 ^
+  --accept-rate 1.0
 ```
 
-## Key Metrics
+### Quick Comparison Preset
 
-The simulator tracks and reports:
-
-### Request Metrics
-- **Completed Requests**: Successfully processed requests
-- **Request Latency**: Time from arrival to completion
-- **Queue Size**: Active requests awaiting processing
-
-### Token Metrics
-- **Total Tokens Generated**: Proposed tokens from SD
-- **Total Tokens Accepted**: Tokens confirmed by acceptance
-- **SD Acceptance Rate**: Ratio of accepted to generated tokens
-- **Overall Throughput**: Tokens/sec (accepted tokens only)
-
-### System Metrics
-- **Batch Count**: Number of batches processed
-- **KV Cache Utilization**: Memory usage percentage
-- **Average Batch Latency**: Time per batch step
-- **GPU Utilization**: Model compute efficiency (estimate)
-
-## Performance Characteristics
-
-### Expected Results (Default Config)
-- **Throughput**: 1,500-2,000 tokens/sec
-- **SD Acceptance Rate**: 80-90% (depends on quality)
-- **Latency**: 50-200ms per request
-- **Memory Utilization**: 60-85% of KV budget
-
-### Scalability Observations
-1. **Batch Size**: Near-linear throughput improvement up to batch=32
-2. **Accept Rate**: Lower acceptance (poor SD) → reduced effective throughput
-3. **Chunk Size**: Larger chunks reduce overhead but increase rejection likelihood
-4. **Memory**: System saturates when KV budget exceeded (blocking new requests)
-
-## Research Questions
-
-The simulator helps answer:
-
-1. **What is the optimal batch size for my hardware/model?**
-   - Run `experiments.py` batch size sweep
-
-2. **How does SD quality (accept_rate) affect throughput?**
-   - Run `experiments.py` accept rate sweep → generates speedup curves
-
-3. **What is the best chunk size for verification?**
-   - Trade-off: Larger chunks → better compute efficiency, but higher rejection
-   - Run `experiments.py` chunk size sweep
-
-4. **What happens under high load?**
-   - Run `experiments.py` arrival rate sweep
-   - Check KV cache saturation point
-
-5. **What's the speedup from using SD?**
-   - Run baseline comparison with chunk_size=1, accept_rate=1.0 vs your config
-
-## Advanced Usage
-
-### Custom Request Patterns
-
-```python
-# Create custom request generator
-class CustomRequestGenerator(RequestGenerator):
-    def generate_request(self, current_time):
-        # Your custom distribution logic
-        return Request(...)
-
-# Use in simulator
-simulator.request_gen = CustomRequestGenerator(config)
-simulator.run_simulation(30.0)
+```bash
+python sim/quickstart.py compare
 ```
 
-### Performance Profiling
+## Offline Calibration Mode
 
-```python
-import cProfile
-import pstats
+If you want a better proxy mode but do not want full online HF execution for
+every experiment, you can benchmark a grid of shapes and then load it into
+`ComputeModel`.
 
-profiler = cProfile.Profile()
-profiler.enable()
+Generate a table:
 
-simulator.run_simulation(30.0)
-
-profiler.disable()
-stats = pstats.Stats(profiler)
-stats.sort_stats('cumulative')
-stats.print_stats(20)
+```bash
+python sim/hardware_benchmark.py --model /path/to/your/model --output sim/benchmark_table.json
 ```
 
-### Sensitivity Analysis
+Use it:
 
-```python
-# Sweep multiple parameters
-for batch_size in [8, 16, 32]:
-    for accept_rate in [0.7, 0.85, 1.0]:
-        config = SystemConfig(
-            max_batch_size=batch_size,
-            avg_accept_rate=accept_rate
-        )
-        sim = BatchSDSimulator(config)
-        sim.run_simulation(20.0)
-        # Log results
+```bash
+python sim/run_online.py --benchmark-table-path sim/benchmark_table.json
 ```
 
-## Limitations & Future Work
+This is useful for:
 
-### Current Limitations
-1. **Simplified Compute Model**: Linear throughput scaling (real GPU has non-linear behavior)
-2. **No Prefill/Decode Distinction**: Treats all compute uniformly (no prefill batching)
-3. **No Attention Pattern Impact**: Ignores sequence length impact on attention
-4. **Simple Scheduling**: Greedy job selection (no FIFO or priority queues)
-5. **No Token Variance**: All sequences generate same chunk size
+- large sweeps
+- quick iteration after one calibration pass
 
-### Potential Enhancements
-- [ ] Realistic GPU performance model (roofline model)
-- [ ] Separate prefill vs decode phases
-- [ ] Variable chunk sizes per request
-- [ ] FCFS/priority scheduling policies
-- [ ] Preemption and request swapping
-- [ ] Multi-GPU simulation
-- [ ] Exact throughput benchmarking integration
-- [ ] Token-level latency tracking (time-to-first-token)
+But it is still less faithful than the online real compute mode because it
+cannot capture all time-varying interactions between scheduler decisions and
+runtime behavior.
 
-## Troubleshooting
+## Recommended Experimental Workflow
 
-### Issue: Low throughput
-- Check batch size (should be > 8 for good efficiency)
-- Verify KV budget not exceeded
-- Check SD acceptance rate (too low means wasted compute)
+### Phase 1: Logic and Stability
 
-### Issue: High latency
-- Reduce arrival_rate (system overloaded)
-- Increase GPU memory or batch scheduling window
-- Check for request rejection due to memory
+Run proxy mode first.
 
-### Issue: Requests not completing
-- Check if max_new_tokens is reasonable
-- Verify accept_rate > 0 (tokens must be accepted)
-- Check simulator duration is long enough
+Goals:
 
-## Citation
+- verify the scheduler loop behaves sensibly
+- check whether queueing and KV pressure trends make sense
+- identify rough regions of interest
 
-If you use this simulator in research, please cite:
+### Phase 2: Online Real Compute
 
-```bibtex
-@misc{sd_batch_simulator,
-  title={Batch Request + Speculative Decoding LLM Serving Simulator},
-  year={2024}
-}
+Switch to `use_real_compute=True`.
+
+Goals:
+
+- measure real latency under dynamic batching
+- measure peak memory behavior under different `chunk_size`
+- validate whether proxy conclusions survive real execution
+
+### Phase 3: Comparative Studies
+
+Compare:
+
+- `SD on` vs `SD off`
+- low vs high `accept_rate`
+- small vs large `chunk_size`
+- low vs high arrival pressure
+- poisson vs rollout-burst workloads
+
+This is where you should look for:
+
+- throughput gain regions
+- latency blow-up regions
+- backlog / instability regions
+- negative-return SD regions
+
+## Why This Can Still Be Useful Even Though It Is Not vLLM
+
+This framework can reflect real system behavior well enough to be useful if
+your question is:
+
+- "Is there likely a system-level performance issue when SD is introduced into
+  an async rollout scheduler?"
+
+It is especially helpful because it preserves the most important coupling:
+
+- dynamic queueing
+- KV pressure
+- variable batch composition
+- real online compute cost
+- acceptance-driven request evolution
+
+That coupling is the heart of your research question.
+
+## What It Still Does Not Capture Perfectly
+
+- vLLM’s exact paged-attention kernels
+- kernel-level memory bandwidth counters
+- exact cache management details of production servers
+- networking / RPC overhead
+- tokenizer and application-layer preprocessing cost
+- semantic differences in real generated tokens
+
+So the right interpretation is:
+
+- good for system behavior trends
+- good for stress-testing SD under async rollout dynamics
+- not a final replacement for production benchmarking
+
+## Extending The Framework
+
+Natural next steps:
+
+- integrate NVML sampling for SM / memory utilization traces
+- add per-step trace export to CSV or JSONL
+- add better packing policies
+- add a more vLLM-like admission policy
+- add explicit TTFT and TPOT metrics
+- add speculative verify implementations beyond probabilistic acceptance
+- plug in your history-based SD path from `engine/sd_core.py`
+
+## Current Status
+
+The repository currently supports:
+
+- online scheduling loop
+- async rollout-like workload generation
+- KV-aware dynamic batching
+- proxy compute mode
+- real HF online compute mode
+- offline calibration mode
+- acceptance-driven request updates
+- summary metrics for throughput, latency, backlog, and memory
+
+## Validation
+
+Local test status in the current workspace:
+
+```bash
+pytest sim/test_simulator.py -q
 ```
 
-## License
+Current result:
 
-MIT
+```text
+26 passed
+```
 
-## Questions?
+## Practical Advice
 
-Check the README.md in the parent directory for project context and related work.
+If your immediate goal is to decide whether SD is risky for async rollout
+serving, the most convincing workflow is:
+
+1. use this simulator in `real_hf` mode
+2. sweep `chunk_size`, `accept_rate`, and `arrival_rate`
+3. compare against `SD off`
+4. identify the region where throughput gain disappears or backlog grows
+
+That will give you a strong answer quickly, even before you invest in a full
+serving-system implementation.

@@ -269,3 +269,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# python sim/hardware_benchmark.py --model <model_path> --output sim/benchmark_table.json
+

@@ -206,60 +206,60 @@ python sim/run_online.py --duration 20 --workload-mode mixed
 Export summary + per-step trace + windowed metrics:
 
 ```bash
-python sim/run_online.py ^
-  --duration 20 ^
-  --output-json sim/run_summary.json ^
-  --output-trace-json sim/step_trace.json ^
+python sim/run_online.py \
+  --duration 20 \
+  --output-json sim/run_summary.json \
+  --output-trace-json sim/step_trace.json \
   --output-window-json sim/window_metrics.json
 ```
 
 Generate plots from those raw files:
 
 ```bash
-python sim/visualizer.py ^
-  --window-json sim/window_metrics.json ^
-  --trace-json sim/step_trace.json ^
-  --output-dir sim/plots ^
+python sim/visualizer.py \
+  --window-json sim/window_metrics.json \
+  --trace-json sim/step_trace.json \
+  --output-dir sim/plots \
   --prefix rollout_run
 ```
 
 ### Async Rollout Style Traffic
 
 ```bash
-python sim/run_online.py ^
-  --duration 30 ^
-  --workload-mode rollout_burst ^
-  --rollout-burst-size 12 ^
-  --arrival-rate 16 ^
-  --batch-size 16 ^
-  --chunk-size 4 ^
+python sim/run_online.py \
+  --duration 30 \
+  --workload-mode rollout_burst \
+  --rollout-burst-size 12 \
+  --arrival-rate 16 \
+  --batch-size 16 \
+  --chunk-size 4 \
   --accept-rate 0.85
 ```
 
 ### Real HF Online Compute
 
 ```bash
-python sim/run_online.py ^
-  --use-real-compute ^
-  --model /path/to/your/model ^
-  --device cuda ^
-  --dtype float16 ^
-  --duration 30 ^
-  --workload-mode rollout_burst ^
-  --arrival-rate 16 ^
-  --batch-size 16 ^
-  --max-concurrent 64 ^
-  --chunk-size 4 ^
-  --accept-rate 0.85 ^
+python sim/run_online.py \
+  --use-real-compute \
+  --model /path/to/your/model \
+  --device cuda \
+  --dtype float16 \
+  --duration 30 \
+  --workload-mode rollout_burst \
+  --arrival-rate 16 \
+  --batch-size 16 \
+  --max-concurrent 64 \
+  --chunk-size 4 \
+  --accept-rate 0.85 \
   --verbose
 ```
 
 ### Disable Speculative Decoding for Baseline
 
 ```bash
-python sim/run_online.py ^
-  --disable-speculative ^
-  --chunk-size 1 ^
+python sim/run_online.py \
+  --disable-speculative \
+  --chunk-size 1 \
   --accept-rate 1.0
 ```
 

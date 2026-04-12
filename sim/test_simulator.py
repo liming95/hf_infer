@@ -3,6 +3,9 @@ Unit tests and validation for the SD simulator
 """
 
 import unittest
+import json
+import tempfile
+import os
 from simulator import (
     Request, SystemConfig, RequestGenerator, KVCacheManager,
     ComputeModel, SDAccepter, BatchScheduler, BatchSDSimulator
@@ -177,6 +180,33 @@ class TestComputeModel(unittest.TestCase):
         latency_8 = model.estimate_latency(batch_size=8, avg_seq_len=100)
         
         self.assertGreater(latency_8, latency_1)
+    
+    def test_benchmark_table_lookup(self):
+        payload = {
+            "prefill": [
+                {"batch_size": 4, "prompt_len": 128, "latency_ms": 12.5},
+            ],
+            "decode": [
+                {"batch_size": 4, "seq_len": 256, "chunk_size": 4, "latency_ms": 3.5},
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as handle:
+            json.dump(payload, handle)
+            path = handle.name
+        try:
+            config = SystemConfig(benchmark_table_path=path)
+            model = ComputeModel(config)
+            reqs = [
+                Request(i, prompt_len=32, max_new_tokens=64, arrival_time=0.0, accept_rate=1.0)
+                for i in range(4)
+            ]
+            for req in reqs:
+                req.prefill_done = True
+                req.current_seq_len = 256
+            self.assertEqual(model._nearest_prefill_latency(4, 128), 12.5)
+            self.assertEqual(model.estimate_decode_latency(reqs, 4), 3.5)
+        finally:
+            os.unlink(path)
 
 
 class TestSDAccepter(unittest.TestCase):

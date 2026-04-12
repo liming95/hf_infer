@@ -12,7 +12,9 @@ matter for the research questions in ``sim/readme.md``:
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import random
 from collections import deque
 from dataclasses import dataclass, field
@@ -87,6 +89,7 @@ class SystemConfig:
     workload_mode: str = "poisson"  # poisson | rollout_burst | mixed
     rollout_burst_size: int = 8
     long_request_ratio: float = 0.2
+    benchmark_table_path: Optional[str] = None
 
     enable_speculative: bool = True
     verify_parallelism: float = 0.32
@@ -241,11 +244,48 @@ class ComputeModel:
 
     def __init__(self, config: SystemConfig):
         self.config = config
+        self.prefill_points: List[Dict[str, float]] = []
+        self.decode_points: List[Dict[str, float]] = []
+        self._load_benchmark_table()
+
+    def _load_benchmark_table(self) -> None:
+        path = self.config.benchmark_table_path
+        if not path or not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.prefill_points = list(payload.get("prefill", []))
+        self.decode_points = list(payload.get("decode", []))
+
+    def _nearest_prefill_latency(self, batch_size: int, prompt_tokens: int) -> Optional[float]:
+        if not self.prefill_points:
+            return None
+        point = min(
+            self.prefill_points,
+            key=lambda item: abs(item["batch_size"] - batch_size) + abs(item["prompt_len"] - prompt_tokens),
+        )
+        return float(point["latency_ms"])
+
+    def _nearest_decode_latency(self, batch_size: int, seq_len: float, verify_width: float) -> Optional[float]:
+        if not self.decode_points:
+            return None
+        point = min(
+            self.decode_points,
+            key=lambda item: (
+                abs(item["batch_size"] - batch_size)
+                + abs(item["seq_len"] - seq_len)
+                + abs(item["chunk_size"] - verify_width)
+            ),
+        )
+        return float(point["latency_ms"])
 
     def estimate_prefill_latency(self, requests: List[Request]) -> float:
         if not requests:
             return 0.0
         total_prompt_tokens = sum(r.prompt_len for r in requests)
+        measured = self._nearest_prefill_latency(len(requests), total_prompt_tokens)
+        if measured is not None:
+            return measured
         batch_gain = math.sqrt(len(requests))
         latency = (
             self.config.scheduler_overhead_ms
@@ -260,6 +300,9 @@ class ComputeModel:
 
         batch_size = len(requests)
         avg_seq_len = mean(r.current_seq_len for r in requests)
+        measured = self._nearest_decode_latency(batch_size, avg_seq_len, verify_width)
+        if measured is not None:
+            return measured
         seq_factor = max(1.0, (avg_seq_len / 128.0) ** self.config.attention_seq_scaling)
         parallel_width = 1.0 + max(0.0, verify_width - 1.0) * self.config.verify_parallelism
         draft_cost = verify_width * self.config.draft_cost_ratio

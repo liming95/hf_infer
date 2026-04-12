@@ -382,6 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-concurrent", type=int, default=48)
     parser.add_argument("--accept-rate", type=float, default=0.85)
+    parser.add_argument("--avg-prompt-len", type=int, default=50)
+    parser.add_argument("--avg-max-tokens", type=int, default=200)
     parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "mixed"])
     return parser
 
@@ -419,6 +421,8 @@ def main() -> None:
                 max_concurrent_requests=args.max_concurrent,
                 chunk_size=cs,
                 avg_accept_rate=args.accept_rate,
+                avg_prompt_len=args.avg_prompt_len,
+                avg_max_tokens=args.avg_max_tokens,
                 enable_speculative=cs > 1,
                 workload_mode=args.workload_mode,
                 use_real_compute=args.use_real_compute,

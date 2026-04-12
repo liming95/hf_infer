@@ -86,6 +86,13 @@ modifying a full serving stack.
   CLI entrypoint for running a single simulation with either proxy or real HF
   compute.
 
+- [run_hf_real_pipeline.py](d:/phd/git/hf_infer/sim/run_hf_real_pipeline.py)
+  One-shot pipeline that runs a real-HF experiment, exports raw data, runs a
+  chunk-size sweep, and generates all plots into `sim/results/<run_name>/`.
+
+- [run_hf_real_pipeline.ps1](d:/phd/git/hf_infer/sim/run_hf_real_pipeline.ps1)
+  PowerShell wrapper for the pipeline script on Windows.
+
 - [hardware_benchmark.py](d:/phd/git/hf_infer/sim/hardware_benchmark.py)
   Offline shape benchmark utility. Useful if you want a calibrated proxy mode,
   but it does **not** replace the online real compute mode.
@@ -252,6 +259,73 @@ python sim/run_online.py \
   --chunk-size 4 \
   --accept-rate 0.85 \
   --verbose
+```
+
+### One-Shot HF Real Pipeline
+
+If you want one command that runs the experiment, exports raw data, saves
+reports, and generates plots into `sim/results/`, use:
+
+```bash
+python sim/run_hf_real_pipeline.py \
+  --use-real-compute \
+  --model /path/to/your/model \
+  --duration 20 \
+  --arrival-rate 10 \
+  --batch-size 16 \
+  --max-concurrent 48 \
+  --chunk-size 4 \
+  --accept-rate 0.85 \
+  --avg-prompt-len 1024 \
+  --avg-max-tokens 2048 \
+  --workload-mode mixed \
+  --device cuda \
+  --dtype float16
+```
+
+On Windows PowerShell:
+
+```powershell
+.\sim\run_hf_real_pipeline.ps1 `
+  -Model "D:\models\Qwen2.5-1.5B-Instruct" `
+  -RunName "hf_real_long_seq" `
+  -Duration 20 `
+  -ArrivalRate 10 `
+  -BatchSize 16 `
+  -MaxConcurrent 48 `
+  -ChunkSize 4 `
+  -AcceptRate 0.85 `
+  -AvgPromptLen 1024 `
+  -AvgMaxTokens 2048 `
+  -WorkloadMode mixed `
+  -Device cuda `
+  -DType float16
+```
+
+The pipeline creates:
+
+```text
+sim/results/<run_name>/
+  manifest.json
+  overview.json
+  online_summary.json
+  online_window_metrics.json
+  online_step_trace.json
+  chunk_results.json
+  chunk_report.md
+  chunk_summary.csv
+  plots/
+    baseline_comparison_overview.png
+    chunk_size_focus_dashboard.png
+    chunk_size_granularity_comparison.png
+    online_throughput_and_acceptance.png
+    online_queue_and_batch.png
+    online_latency_and_kv.png
+    online_gpu_and_memory.png
+    online_step_batch_and_queue.png
+    online_step_latency.png
+    online_step_kv_and_gpu.png
+    online_step_memory.png
 ```
 
 ### Disable Speculative Decoding for Baseline

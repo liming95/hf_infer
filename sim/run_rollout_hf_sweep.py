@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, help="Run only the first N configurations.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--save-step-traces", action="store_true")
+    parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -137,6 +138,37 @@ def flatten_summary(item: dict, summary: dict) -> dict:
         "arrived_requests": summary["arrived_requests"],
         "simulation_time": summary["simulation_time"],
         "stop_condition": summary["stop_condition"],
+        "status": "ok",
+        "error": "",
+    }
+
+
+def failed_row(item: dict, error: Exception) -> dict:
+    return {
+        "batch_size": item["batch_size"],
+        "prompt_len": item.get("prompt_len"),
+        "max_tokens": item["max_tokens"],
+        "chunk_size": item["chunk_size"],
+        "sd_rate": item["sd_rate"],
+        "enable_speculative": item["enable_speculative"],
+        "throughput_tokens_per_sec": 0.0,
+        "avg_request_latency_sec": 0.0,
+        "p95_request_latency_sec": 0.0,
+        "avg_queue_wait_sec": 0.0,
+        "stability_ratio": 0.0,
+        "peak_kv_utilization": 0.0,
+        "avg_batch_size": 0.0,
+        "draft_acceptance_rate": 0.0,
+        "fallback_share": 0.0,
+        "oom_events_count": 0,
+        "oom_retry_count": 0,
+        "avg_executed_chunk_size": 0.0,
+        "completed_requests": 0,
+        "arrived_requests": 0,
+        "simulation_time": 0.0,
+        "stop_condition": "error",
+        "status": "failed",
+        "error": repr(error).replace("\n", " "),
     }
 
 
@@ -214,6 +246,9 @@ def _pick_middle(values: List):
 
 
 def plot_metric_vs_chunk(rows: List[dict], plot_dir: Path, fixed_batch_size: int, metric: str, ylabel: str, filename: str) -> str:
+    rows = [row for row in rows if row.get("status") == "ok"]
+    if not rows:
+        return f"{filename}: skipped because all rows failed."
     max_tokens_values = unique_values(rows, "max_tokens")
     sd_rates = unique_values(rows, "sd_rate")
     sd_rates = [value for value in sd_rates if value < 1.0] or sd_rates
@@ -247,6 +282,9 @@ def plot_metric_vs_chunk(rows: List[dict], plot_dir: Path, fixed_batch_size: int
 
 
 def plot_metric_vs_batch(rows: List[dict], plot_dir: Path, fixed_max_tokens: int, fixed_sd_rate: float) -> str:
+    rows = [row for row in rows if row.get("status") == "ok"]
+    if not rows:
+        return "throughput_vs_batch_by_chunk.png: skipped because all rows failed."
     chunk_sizes = unique_values(rows, "chunk_size")
     fig, ax = plt.subplots(figsize=(10, 6))
     for chunk_size in chunk_sizes:
@@ -287,6 +325,7 @@ def plot_heatmap(
     title: str,
 ) -> str:
     selected = filter_rows(rows, **fixed)
+    selected = [row for row in selected if row.get("status") == "ok"]
     x_values = unique_values(selected, x_key)
     y_values = unique_values(selected, y_key)
     if not selected or not x_values or not y_values:
@@ -323,12 +362,21 @@ def plot_heatmap(
 def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
     if not rows:
         return
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    if not ok_rows:
+        plot_dir = result_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        (plot_dir / "README_PLOTS.md").write_text(
+            "# Plot Guide\n\nNo plots were generated because all configurations failed.",
+            encoding="utf-8",
+        )
+        return
     plot_dir = result_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    batch_sizes = unique_values(rows, "batch_size")
-    max_tokens_values = unique_values(rows, "max_tokens")
-    sd_rates = [value for value in unique_values(rows, "sd_rate") if value < 1.0]
+    batch_sizes = unique_values(ok_rows, "batch_size")
+    max_tokens_values = unique_values(ok_rows, "max_tokens")
+    sd_rates = [value for value in unique_values(ok_rows, "sd_rate") if value < 1.0]
     fixed_batch_size = _pick_middle(batch_sizes)
     fixed_max_tokens = _pick_middle(max_tokens_values)
     fixed_sd_rate = _pick_middle(sd_rates) if sd_rates else unique_values(rows, "sd_rate")[0]
@@ -336,7 +384,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
     descriptions = [
         f"Global prompt_len={prompt_len}.",
         plot_metric_vs_chunk(
-            rows,
+            ok_rows,
             plot_dir,
             fixed_batch_size=fixed_batch_size,
             metric="throughput_tokens_per_sec",
@@ -344,7 +392,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             filename="throughput_vs_chunk_by_max_tokens.png",
         ),
         plot_metric_vs_chunk(
-            rows,
+            ok_rows,
             plot_dir,
             fixed_batch_size=fixed_batch_size,
             metric="avg_request_latency_sec",
@@ -352,13 +400,13 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             filename="latency_vs_chunk_by_max_tokens.png",
         ),
         plot_metric_vs_batch(
-            rows,
+            ok_rows,
             plot_dir,
             fixed_max_tokens=fixed_max_tokens,
             fixed_sd_rate=fixed_sd_rate,
         ),
         plot_heatmap(
-            rows,
+            ok_rows,
             plot_dir,
             x_key="chunk_size",
             y_key="batch_size",
@@ -368,7 +416,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             title="OOM count by batch size and chunk size",
         ),
         plot_heatmap(
-            rows,
+            ok_rows,
             plot_dir,
             x_key="chunk_size",
             y_key="sd_rate",
@@ -378,7 +426,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             title="Throughput by chunk size and SD rate",
         ),
         plot_heatmap(
-            rows,
+            ok_rows,
             plot_dir,
             x_key="chunk_size",
             y_key="max_tokens",
@@ -426,23 +474,38 @@ def main() -> None:
             f"[{index + 1}/{len(configs)}] batch={item['batch_size']} max_tokens={item['max_tokens']} "
             f"chunk={item['chunk_size']} sd_rate={item['sd_rate']}"
         )
-        sim = BatchSDSimulator(build_system_config(args, item), seed=args.seed)
-        summary = sim.run(
-            duration_seconds=args.duration,
-            target_completed_requests=args.target_completed_requests,
-            verbose=False,
-        )
-        window_metrics = sim.get_windowed_metrics(window_sec=args.window_sec)
-        row = flatten_summary(item, summary)
+        try:
+            sim = BatchSDSimulator(build_system_config(args, item), seed=args.seed)
+            summary = sim.run(
+                duration_seconds=args.duration,
+                target_completed_requests=args.target_completed_requests,
+                verbose=False,
+            )
+            window_metrics = sim.get_windowed_metrics(window_sec=args.window_sec)
+            row = flatten_summary(item, summary)
+            result = {
+                "config": item,
+                "status": "ok",
+                "summary": summary,
+                "window_metrics": window_metrics,
+                "oom_events": [asdict(event) for event in sim.oom_events],
+            }
+            if args.save_step_traces:
+                result["step_trace"] = [asdict(step) for step in sim.step_traces]
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            print(f"Config failed, continuing: {repr(exc)}")
+            row = failed_row(item, exc)
+            result = {
+                "config": item,
+                "status": "failed",
+                "error": repr(exc),
+                "summary": None,
+                "window_metrics": [],
+                "oom_events": [],
+            }
         rows.append(row)
-        result = {
-            "config": item,
-            "summary": summary,
-            "window_metrics": window_metrics,
-            "oom_events": [asdict(event) for event in sim.oom_events],
-        }
-        if args.save_step_traces:
-            result["step_trace"] = [asdict(step) for step in sim.step_traces]
         full_results.append(result)
         raw_path = raw_dir / (
             f"batch{item['batch_size']}_max{item['max_tokens']}_chunk{item['chunk_size']}_sd{item['sd_rate']}.json"

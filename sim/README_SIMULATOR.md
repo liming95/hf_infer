@@ -362,6 +362,31 @@ If you want full per-step traces for every config, add:
 
 That can create large files, so it is off by default.
 
+For long `nohup` sweeps, add `--continue-on-error` so one failed configuration
+does not stop the whole grid:
+
+```bash
+nohup python sim/run_rollout_hf_sweep.py \
+  --model /workspace/models/Qwen2.5-1.5B-Instruct \
+  --run-name rollout_hf_grid \
+  --target-completed-requests 64 \
+  --prompt-len 1024 \
+  --batch-sizes 4,8,16 \
+  --max-token-lens 256,1024,2048 \
+  --chunk-sizes 1,2,4,8,16 \
+  --sd-rates 0.60,0.75,0.90 \
+  --rollout-pull-batch-size 8 \
+  --rollout-pull-target-outstanding 32 \
+  --gpu-memory-mb 46000 \
+  --compute-memory-margin-mb 4096 \
+  --device cuda \
+  --dtype float16 \
+  --continue-on-error > my_run.log 2>&1 &
+```
+
+Failed configs are written into `sweep_summary.csv` with `status=failed` and
+their error message, while successful configs remain available for plots.
+
 ### Real HF Online Compute
 
 ```bash

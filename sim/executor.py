@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol
 
 
 @dataclass
@@ -117,6 +117,8 @@ class HFRealExecutor:
         self.model.eval()
         self.vocab_size = int(self.model.config.vocab_size)
         self.forward_signature = inspect.signature(self.model.forward)
+        self.decode_cache_bucket_size = 128
+        self._decode_cache: Dict[tuple, object] = {}
 
     def _last_logits_kwargs(self) -> dict:
         kwargs = {}
@@ -140,6 +142,38 @@ class HFRealExecutor:
         )
         mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
         return ids, mask
+
+    def _bucket_seq_len(self, seq_len: int) -> int:
+        bucket = self.decode_cache_bucket_size
+        return max(bucket, ((seq_len + bucket - 1) // bucket) * bucket)
+
+    def _clear_decode_cache(self) -> None:
+        self._decode_cache.clear()
+        if self.device.startswith("cuda"):
+            self.torch.cuda.empty_cache()
+
+    def _get_past_key_values(self, batch_size: int, seq_len: int, logits_kwargs: dict):
+        torch = self.torch
+        bucketed_seq_len = self._bucket_seq_len(seq_len)
+        key = (batch_size, bucketed_seq_len)
+        if key in self._decode_cache:
+            return self._decode_cache[key], bucketed_seq_len
+
+        # Keep the cache small: this avoids doing a full prefix prefill on every
+        # decode step while not letting cached KV for many shapes consume all memory.
+        self._clear_decode_cache()
+        prefix_ids, prefix_mask = self._rand_ids(batch_size, bucketed_seq_len)
+        with torch.inference_mode():
+            prefill_outputs = self.model(
+                input_ids=prefix_ids,
+                attention_mask=prefix_mask,
+                use_cache=True,
+                **logits_kwargs,
+            )
+            past_key_values = prefill_outputs.past_key_values
+            del prefill_outputs
+        self._decode_cache[key] = past_key_values
+        return past_key_values, bucketed_seq_len
 
     def _measure(self, fn, phase: str, batch_size: int, max_seq_len: int, chunk_size: int):
         torch = self.torch
@@ -201,6 +235,7 @@ class HFRealExecutor:
             max_seq_len=max_prompt,
             chunk_size=0,
         )
+        self._clear_decode_cache()
         return ExecutionMetrics(
             phase="prefill",
             latency_ms=latency_ms,
@@ -218,20 +253,10 @@ class HFRealExecutor:
             return ExecutionMetrics("decode", 0.0, 0, 0, 0, note="real")
         batch_size = len(seq_lengths)
         max_seq = max(seq_lengths)
-        prefix_ids, prefix_mask = self._rand_ids(batch_size, max_seq)
         next_ids, _ = self._rand_ids(batch_size, max(1, chunk_size))
         torch = self.torch
         logits_kwargs = self._last_logits_kwargs()
-
-        with torch.inference_mode():
-            prefill_outputs = self.model(
-                input_ids=prefix_ids,
-                attention_mask=prefix_mask,
-                use_cache=True,
-                **logits_kwargs,
-            )
-            past_key_values = prefill_outputs.past_key_values
-            del prefill_outputs
+        past_key_values, bucketed_seq_len = self._get_past_key_values(batch_size, max_seq, logits_kwargs)
 
         @torch.inference_mode()
         def run():
@@ -246,20 +271,19 @@ class HFRealExecutor:
             run,
             phase="decode",
             batch_size=batch_size,
-            max_seq_len=max_seq,
+            max_seq_len=bucketed_seq_len,
             chunk_size=max(1, chunk_size),
         )
-        del past_key_values
-        if self.device.startswith("cuda"):
-            torch.cuda.empty_cache()
+        if hasattr(past_key_values, "crop"):
+            past_key_values.crop(bucketed_seq_len)
         return ExecutionMetrics(
             phase="decode",
             latency_ms=latency_ms,
             batch_size=batch_size,
-            max_seq_len=max_seq,
+            max_seq_len=bucketed_seq_len,
             total_tokens=batch_size * max(1, chunk_size),
             memory_allocated_mb=allocated,
             max_memory_allocated_mb=peak_alloc,
             memory_reserved_mb=reserved,
-            note="real",
+            note=f"real_cached_kv_bucket={bucketed_seq_len}",
         )

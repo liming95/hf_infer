@@ -121,6 +121,13 @@ def build_system_config(args, item: dict) -> SystemConfig:
     )
 
 
+def estimate_decode_steps(args, item: dict) -> int:
+    chunk = max(1, item["chunk_size"])
+    batch = max(1, item["batch_size"])
+    total_decode_tokens = args.target_completed_requests * item["max_tokens"]
+    return max(1, (total_decode_tokens + batch * chunk - 1) // (batch * chunk))
+
+
 def flatten_summary(item: dict, summary: dict) -> dict:
     return {
         "batch_size": item["batch_size"],
@@ -513,7 +520,8 @@ def main() -> None:
         item = dict(item)
         print(
             f"[{index + 1}/{len(configs)}] batch={item['batch_size']} prompt_len={item['prompt_len']} max_tokens={item['max_tokens']} "
-            f"chunk={item['chunk_size']} sd_rate={item['sd_rate']}"
+            f"chunk={item['chunk_size']} sd_rate={item['sd_rate']} "
+            f"est_decode_steps~{estimate_decode_steps(args, item)}"
         )
         try:
             sim = BatchSDSimulator(build_system_config(args, item), seed=args.seed)

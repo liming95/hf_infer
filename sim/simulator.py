@@ -75,6 +75,9 @@ class StepTrace:
     prefill_batch_size: int
     decode_batch_size: int
     verify_width: float
+    new_arrivals: int
+    new_admissions: int
+    new_completions: int
     queued_requests: int
     active_requests: int
     kv_utilization: float
@@ -87,8 +90,15 @@ class StepTrace:
     rejected_draft_tokens: int
     fallback_tokens: int
     committed_tokens: int
+    step_draft_tokens: int
+    step_accepted_draft_tokens: int
+    step_rejected_draft_tokens: int
+    step_fallback_tokens: int
+    step_committed_tokens: int
     avg_seq_len: float
+    max_seq_len: int
     avg_prompt_len: float
+    avg_remaining_tokens: float
     executor_mode: str
     requested_chunk_size: int
     executed_chunk_size: int
@@ -137,8 +147,10 @@ class SystemConfig:
     avg_prompt_len: int = 50
     avg_max_tokens: int = 200
     avg_accept_rate: float = 0.8
-    workload_mode: str = "poisson"  # poisson | rollout_burst | mixed
+    workload_mode: str = "poisson"  # poisson | rollout_burst | rollout_pull | mixed
     rollout_burst_size: int = 8
+    rollout_pull_batch_size: int = 8
+    rollout_pull_target_outstanding: int = 16
     long_request_ratio: float = 0.2
     benchmark_table_path: Optional[str] = None
     use_real_compute: bool = False
@@ -186,6 +198,7 @@ class RequestGenerator:
         self.np_rng = np.random.RandomState(seed)
         self.request_counter = 0
         self._burst_remaining = 0
+        self._pull_remaining = 0
 
     def _sample_prompt_len(self) -> int:
         base = self.config.avg_prompt_len
@@ -223,6 +236,9 @@ class RequestGenerator:
 
     def next_arrival_time(self, last_arrival: float) -> float:
         mode = self.config.workload_mode
+        if mode == "rollout_pull":
+            # External scheduler decides when to pull the next rollout batch.
+            return float("inf")
         if mode == "rollout_burst":
             if self._burst_remaining <= 0:
                 self._burst_remaining = max(1, self.config.rollout_burst_size - 1)
@@ -589,6 +605,7 @@ class BatchSDSimulator:
         self.execution_trace: List[ExecutionMetrics] = []
         self.step_traces: List[StepTrace] = []
         self.oom_events: List[OOMEvent] = []
+        self.stop_reason: str = "unknown"
 
     def _build_executor(self):
         if self.config.use_real_compute:
@@ -602,33 +619,115 @@ class BatchSDSimulator:
         return ProxyExecutor(self.compute_model)
 
     def run_simulation(self, duration_seconds: float = 60.0, verbose: bool = False) -> Dict[str, float]:
+        return self.run(
+            duration_seconds=duration_seconds,
+            target_completed_requests=None,
+            verbose=verbose,
+        )
+
+    def run(
+        self,
+        duration_seconds: Optional[float] = 60.0,
+        target_completed_requests: Optional[int] = None,
+        verbose: bool = False,
+    ) -> Dict[str, float]:
+        if duration_seconds is None and target_completed_requests is None:
+            raise ValueError("Either duration_seconds or target_completed_requests must be provided")
+
         next_arrival_time = self.request_gen.next_arrival_time(0.0)
 
-        while self.current_time < duration_seconds:
-            next_arrival_time = self._ingest_arrivals(next_arrival_time, duration_seconds, verbose)
-            self._admit_requests()
+        while True:
+            if target_completed_requests is not None and len(self.completed_requests) >= target_completed_requests:
+                self.stop_reason = "completed_requests"
+                break
+            if duration_seconds is not None and self.current_time >= duration_seconds:
+                self.stop_reason = "duration"
+                break
+
+            arrivals_this_step = self._ingest_rollout_pull_arrivals(verbose)
+            next_arrival_time, streamed_arrivals = self._ingest_arrivals(
+                next_arrival_time,
+                duration_seconds,
+                verbose,
+            )
+            arrivals_this_step += streamed_arrivals
+            admissions_this_step = self._admit_requests()
 
             batch = self.scheduler.schedule(self.active_requests)
             if batch:
-                latency_ms = self._process_batch(batch, verbose)
+                latency_ms = self._process_batch(
+                    batch,
+                    verbose,
+                    arrivals_this_step=arrivals_this_step,
+                    admissions_this_step=admissions_this_step,
+                )
                 self.current_time += latency_ms / 1000.0
                 self.queue_size_trace.append(len(self.waiting_requests))
                 continue
 
+            if self.config.workload_mode == "rollout_pull" and target_completed_requests is not None:
+                if not self.waiting_requests and not self.active_requests:
+                    self._ingest_rollout_pull_arrivals(verbose)
+                    admissions_this_step = self._admit_requests()
+                    batch = self.scheduler.schedule(self.active_requests)
+                    if batch:
+                        continue
+
+            if duration_seconds is None:
+                if target_completed_requests is not None and not self.waiting_requests and not self.active_requests:
+                    self.stop_reason = "idle_before_target"
+                    break
+                self.current_time += 0.001
+                continue
+
             if next_arrival_time >= duration_seconds:
+                self.stop_reason = "duration_idle"
                 break
             self.current_time = max(self.current_time, next_arrival_time)
 
-        summary = self.get_summary(duration_seconds)
+        summary = self.get_summary(duration_seconds if duration_seconds is not None else self.current_time)
         if verbose:
             self._print_summary(summary)
         return summary
 
-    def _ingest_arrivals(self, next_arrival_time: float, duration_seconds: float, verbose: bool) -> float:
+    def _ingest_rollout_pull_arrivals(self, verbose: bool) -> int:
+        if self.config.workload_mode != "rollout_pull":
+            return 0
+        outstanding = len(self.waiting_requests) + len(self.active_requests)
+        if outstanding >= self.config.rollout_pull_target_outstanding:
+            return 0
+
+        pulled = 0
+        while (
+            outstanding + pulled < self.config.rollout_pull_target_outstanding
+            and pulled < self.config.rollout_pull_batch_size
+        ):
+            request = self.request_gen.generate_request(self.current_time)
+            self.waiting_requests.append(request)
+            self.total_arrived_requests += 1
+            pulled += 1
+            if verbose:
+                print(
+                    f"[{self.current_time:7.3f}s] rollout_pull request={request.request_id} arrived "
+                    f"prompt={request.prompt_len} max_new={request.max_new_tokens} "
+                    f"accept={request.accept_rate:.2f}"
+                )
+        return pulled
+
+    def _ingest_arrivals(
+        self,
+        next_arrival_time: float,
+        duration_seconds: Optional[float],
+        verbose: bool,
+    ) -> tuple[float, int]:
+        arrivals = 0
+        if duration_seconds is None:
+            return next_arrival_time, arrivals
         while next_arrival_time <= self.current_time and next_arrival_time < duration_seconds:
             request = self.request_gen.generate_request(next_arrival_time)
             self.waiting_requests.append(request)
             self.total_arrived_requests += 1
+            arrivals += 1
             if verbose:
                 print(
                     f"[{self.current_time:7.3f}s] request={request.request_id} arrived "
@@ -636,9 +735,10 @@ class BatchSDSimulator:
                     f"accept={request.accept_rate:.2f}"
                 )
             next_arrival_time = self.request_gen.next_arrival_time(next_arrival_time)
-        return next_arrival_time
+        return next_arrival_time, arrivals
 
-    def _admit_requests(self) -> None:
+    def _admit_requests(self) -> int:
+        admitted = 0
         while self.waiting_requests and len(self.active_requests) < self.config.max_concurrent_requests:
             request = self.waiting_requests[0]
             projected_kv_mb = self.kv_manager.estimate_request_kv_mb(request.current_seq_len)
@@ -660,8 +760,10 @@ class BatchSDSimulator:
             self.active_requests.append(request)
             self.scheduler.add_request(request)
             self.total_admitted_requests += 1
+            admitted += 1
+        return admitted
 
-    def _process_batch(self, batch: List[Request], verbose: bool) -> float:
+    def _process_batch(self, batch: List[Request], verbose: bool, arrivals_this_step: int = 0, admissions_this_step: int = 0) -> float:
         step_start_time = self.current_time
         effective_batch = list(batch)
         requested_chunk_size = max(1, self.config.chunk_size if self.config.enable_speculative else 1)
@@ -741,6 +843,12 @@ class BatchSDSimulator:
         if decode_requests:
             self.execution_trace.append(decode_metrics)
 
+        step_draft_tokens = 0
+        step_accepted_draft_tokens = 0
+        step_rejected_draft_tokens = 0
+        step_fallback_tokens = 0
+        step_committed_tokens = 0
+
         for request in decode_requests:
             remaining = request.remaining_tokens()
             proposed_tokens = min(remaining, executed_chunk_size)
@@ -769,6 +877,11 @@ class BatchSDSimulator:
             self.total_rejected_tokens += rejected_tokens
             self.total_fallback_tokens += fallback_token
             self.total_completed_tokens += committed_tokens
+            step_draft_tokens += proposed_tokens
+            step_accepted_draft_tokens += accepted_tokens
+            step_rejected_draft_tokens += rejected_tokens
+            step_fallback_tokens += fallback_token
+            step_committed_tokens += committed_tokens
 
         batch_latency_ms = prefill_latency_ms + decode_latency_ms
         self.total_compute_time_ms += batch_latency_ms
@@ -826,6 +939,9 @@ class BatchSDSimulator:
                 prefill_batch_size=len(prefill_requests),
                 decode_batch_size=len(decode_requests),
                 verify_width=verify_width,
+                new_arrivals=arrivals_this_step,
+                new_admissions=admissions_this_step,
+                new_completions=len(completed_now),
                 queued_requests=len(self.waiting_requests),
                 active_requests=len(self.active_requests),
                 kv_utilization=self.kv_manager.get_utilization(),
@@ -838,8 +954,15 @@ class BatchSDSimulator:
                 rejected_draft_tokens=self.total_rejected_tokens,
                 fallback_tokens=self.total_fallback_tokens,
                 committed_tokens=self.total_completed_tokens,
+                step_draft_tokens=step_draft_tokens,
+                step_accepted_draft_tokens=step_accepted_draft_tokens,
+                step_rejected_draft_tokens=step_rejected_draft_tokens,
+                step_fallback_tokens=step_fallback_tokens,
+                step_committed_tokens=step_committed_tokens,
                 avg_seq_len=float(mean([r.current_seq_len for r in batch])) if batch else 0.0,
+                max_seq_len=max([r.current_seq_len for r in batch], default=0),
                 avg_prompt_len=float(mean([r.prompt_len for r in prefill_requests])) if prefill_requests else 0.0,
+                avg_remaining_tokens=float(mean([r.remaining_tokens() for r in batch])) if batch else 0.0,
                 executor_mode="real_hf" if self.config.use_real_compute else "proxy",
                 requested_chunk_size=requested_chunk_size,
                 executed_chunk_size=executed_chunk_size,
@@ -941,6 +1064,7 @@ class BatchSDSimulator:
 
         return {
             "simulation_time": simulation_time,
+            "stop_condition": self.stop_reason,
             "completed_requests": len(self.completed_requests),
             "active_requests": len(self.active_requests),
             "queued_requests": len(self.waiting_requests),

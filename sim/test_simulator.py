@@ -432,6 +432,24 @@ class TestSimulator(unittest.TestCase):
         self.assertGreaterEqual(summary["arrived_requests"], 1)
         self.assertGreaterEqual(summary["admitted_requests"], 1)
 
+    def test_rollout_pull_target_completion(self):
+        config = SystemConfig(
+            workload_mode="rollout_pull",
+            rollout_pull_batch_size=4,
+            rollout_pull_target_outstanding=8,
+            avg_prompt_len=16,
+            avg_max_tokens=16,
+            max_batch_size=4,
+            chunk_size=4,
+        )
+        sim = BatchSDSimulator(config, seed=42)
+        summary = sim.run(duration_seconds=None, target_completed_requests=5)
+
+        self.assertGreaterEqual(summary["completed_requests"], 5)
+        self.assertEqual(summary["stop_condition"], "completed_requests")
+        self.assertGreaterEqual(sim.step_traces[0].new_arrivals, 1)
+        self.assertIn("step_committed_tokens", sim.step_traces[0].__dict__)
+
 
 def run_all_tests():
     """Run all unit tests"""

@@ -43,7 +43,7 @@ Concretely, the simulator is intended to help answer:
 
 - request arrivals
 - prompt length / generation length distributions
-- rollout-burst style asynchronous traffic
+- rollout-burst or rollout-pull style asynchronous traffic
 - scheduler logic
 - KV cache accounting
 - acceptance / rejection outcomes
@@ -73,41 +73,45 @@ modifying a full serving stack.
 
 ## Core Files
 
-- [simulator.py](d:/phd/git/hf_infer/sim/simulator.py)
+- [simulator.py]
   Main event loop. Owns requests, queue, scheduler, KV tracking, batch
   processing, acceptance, and summary metrics.
 
-- [executor.py](d:/phd/git/hf_infer/sim/executor.py)
+- [executor.py]
   Compute backends.
   `ProxyExecutor` is analytical.
   `HFRealExecutor` executes real HF forwards online inside the scheduling loop.
 
-- [run_online.py](d:/phd/git/hf_infer/sim/run_online.py)
+- [run_online.py]
   CLI entrypoint for running a single simulation with either proxy or real HF
   compute.
 
-- [run_hf_real_pipeline.py](d:/phd/git/hf_infer/sim/run_hf_real_pipeline.py)
+- [run_hf_real_pipeline.py]
   One-shot pipeline that runs a real-HF experiment, exports raw data, runs a
   chunk-size sweep, and generates all plots into `sim/results/<run_name>/`.
 
-- [run_hf_real_pipeline.ps1](d:/phd/git/hf_infer/sim/run_hf_real_pipeline.ps1)
+- [run_hf_real_pipeline.ps1]
   PowerShell wrapper for the pipeline script on Windows.
 
-- [hardware_benchmark.py](d:/phd/git/hf_infer/sim/hardware_benchmark.py)
+- [run_rollout_hf_sweep.py]
+  Focused rollout-pull + real-HF sweep over batch size, max generation length,
+  chunk size, and SD acceptance rate.
+
+- [hardware_benchmark.py]
   Offline shape benchmark utility. Useful if you want a calibrated proxy mode,
   but it does **not** replace the online real compute mode.
 
-- [experiments.py](d:/phd/git/hf_infer/sim/experiments.py)
+- [experiments.py]
   Parameter sweeps for quick trend analysis.
 
-- [visualizer.py](d:/phd/git/hf_infer/sim/visualizer.py)
+- [visualizer.py]
   Post-processing plotting tool. Reads saved raw JSON outputs and generates
   comparison plots and time-series plots while preserving the original data.
 
-- [quickstart.py](d:/phd/git/hf_infer/sim/quickstart.py)
+- [quickstart.py]
   A few preset scenarios.
 
-- [test_simulator.py](d:/phd/git/hf_infer/sim/test_simulator.py)
+- [test_simulator.py]
   Tests for queueing, KV tracking, metrics, and benchmark-table fallback logic.
 
 ## System Architecture
@@ -243,6 +247,121 @@ python sim/run_online.py \
   --accept-rate 0.85
 ```
 
+### RLHF Rollout Pull Mode
+
+For the RLHF-style case where the system repeatedly pulls a batch of rollout
+tasks from a dataset instead of receiving Poisson serving traffic, use
+`workload_mode=rollout_pull`.
+
+This mode keeps the number of outstanding rollout tasks near a target watermark.
+When `waiting + active` drops below the target, it pulls a new mini-batch.
+
+```bash
+python sim/run_online.py \
+  --workload-mode rollout_pull \
+  --rollout-pull-batch-size 8 \
+  --rollout-pull-target-outstanding 16 \
+  --target-completed-requests 128 \
+  --batch-size 16 \
+  --max-concurrent 32 \
+  --chunk-size 4 \
+  --accept-rate 0.85 \
+  --avg-prompt-len 1024 \
+  --avg-max-tokens 2048 \
+  --output-json sim/run_summary.json \
+  --output-trace-json sim/step_trace.json \
+  --output-window-json sim/window_metrics.json
+```
+
+This is the recommended mode if your main concern is RLHF rollout throughput
+instead of public LLM serving.
+
+### Stop After a Fixed Number of Tasks
+
+The simulator can stop by duration or by completed task count.
+
+Duration mode:
+
+```bash
+python sim/run_online.py --duration 30
+```
+
+Fixed-task mode:
+
+```bash
+python sim/run_online.py \
+  --workload-mode rollout_pull \
+  --target-completed-requests 128
+```
+
+Fixed-task mode is reasonable for rollout studies because RLHF jobs often care
+about how long it takes to finish a known number of rollout samples.
+
+### Rollout HF Sweep: Batch / Max Tokens / Chunk / SD Rate
+
+For a focused RLHF rollout experiment over the main variables you listed, use:
+
+```bash
+python sim/run_rollout_hf_sweep.py \
+  --model /path/to/model \
+  --run-name rollout_hf_grid \
+  --target-completed-requests 64 \
+  --prompt-len 1024 \
+  --batch-sizes 4,8,16 \
+  --max-token-lens 256,1024,2048 \
+  --chunk-sizes 1,2,4,8,16 \
+  --sd-rates 0.60,0.75,0.90 \
+  --rollout-pull-batch-size 8 \
+  --rollout-pull-target-outstanding 32 \
+  --gpu-memory-mb 48000 \
+  --compute-memory-margin-mb 4096 \
+  --device cuda \
+  --dtype float16
+```
+
+This creates:
+
+```text
+sim/results/rollout_hf_grid/
+  manifest.json
+  sweep_results.json
+  sweep_summary.csv
+  sweep_report.md
+  raw/
+    batch*_max*_chunk*_sd*.json
+```
+
+The default grid is already fairly large:
+
+- batch sizes: `4,8,16`
+- max token lengths: `256,1024,2048`
+- chunk sizes: `1,2,4,8,16`
+- SD rates: `0.60,0.75,0.90`
+
+Use `--dry-run` first to inspect the exact planned configs:
+
+```bash
+python sim/run_rollout_hf_sweep.py --model /path/to/model --dry-run
+```
+
+Use `--limit N` for a small smoke test:
+
+```bash
+python sim/run_rollout_hf_sweep.py \
+  --model /path/to/model \
+  --run-name rollout_hf_smoke \
+  --limit 4 \
+  --target-completed-requests 8
+```
+
+If you want full per-step traces for every config, add:
+
+```bash
+--save-step-traces
+```
+
+That can create large files, so it is off by default.
+
 ### Real HF Online Compute
 
 ```bash
@@ -339,6 +458,21 @@ sim/results/<run_name>/
 
 This is intended specifically for analyzing how `chunk_size` changes influence
 OOM risk in `real_hf` mode.
+
+`online_step_trace.json` records the current data state for each scheduling
+step. Useful fields include:
+
+- `new_arrivals`: how many new rollout requests were added in this step
+- `new_admissions`: how many waiting requests entered active execution
+- `new_completions`: how many requests finished in this step
+- `queued_requests`: current waiting queue size after the step
+- `active_requests`: current active request count after the step
+- `step_committed_tokens`: tokens committed in this step
+- `step_accepted_draft_tokens`: accepted draft tokens in this step
+- `step_rejected_draft_tokens`: rejected draft tokens in this step
+- `avg_seq_len` / `max_seq_len`: current sequence length pressure
+- `avg_remaining_tokens`: how much work remains in the scheduled batch
+- `requested_chunk_size` / `executed_chunk_size`: whether OOM retry changed chunk size
 
 ### Disable Speculative Decoding for Baseline
 

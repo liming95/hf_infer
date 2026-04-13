@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the full HF-real experiment pipeline into sim/results/.")
     parser.add_argument("--run-name")
     parser.add_argument("--duration", type=float, default=20.0)
+    parser.add_argument("--target-completed-requests", type=int)
     parser.add_argument("--window-sec", type=float, default=1.0)
     parser.add_argument("--arrival-rate", type=float, default=10.0)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -35,8 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accept-rate", type=float, default=0.85)
     parser.add_argument("--avg-prompt-len", type=int, default=50)
     parser.add_argument("--avg-max-tokens", type=int, default=200)
-    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "mixed"])
+    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "rollout_pull", "mixed"])
     parser.add_argument("--rollout-burst-size", type=int, default=8)
+    parser.add_argument("--rollout-pull-batch-size", type=int, default=8)
+    parser.add_argument("--rollout-pull-target-outstanding", type=int, default=16)
     parser.add_argument("--gpu-memory-mb", type=float, default=12000)
     parser.add_argument("--use-real-compute", action="store_true")
     parser.add_argument("--model")
@@ -65,6 +68,8 @@ def _base_config(args, chunk_size: int, enable_speculative: bool) -> SystemConfi
         avg_max_tokens=args.avg_max_tokens,
         workload_mode=args.workload_mode,
         rollout_burst_size=args.rollout_burst_size,
+        rollout_pull_batch_size=args.rollout_pull_batch_size,
+        rollout_pull_target_outstanding=args.rollout_pull_target_outstanding,
         gpu_memory_mb=args.gpu_memory_mb,
         enable_speculative=enable_speculative,
         use_real_compute=args.use_real_compute,
@@ -91,7 +96,12 @@ def run_pipeline(args) -> Path:
 
     online_config = _base_config(args, chunk_size=args.chunk_size, enable_speculative=(args.chunk_size > 1))
     simulator = BatchSDSimulator(online_config, seed=args.seed)
-    summary = simulator.run_simulation(duration_seconds=args.duration, verbose=False)
+    duration = None if args.target_completed_requests is not None else args.duration
+    summary = simulator.run(
+        duration_seconds=duration,
+        target_completed_requests=args.target_completed_requests,
+        verbose=False,
+    )
     windowed_metrics = simulator.get_windowed_metrics(window_sec=args.window_sec)
 
     _write_json(result_dir / "online_summary.json", summary)
@@ -105,6 +115,7 @@ def run_pipeline(args) -> Path:
         args.chunk_sweep,
         lambda cs: _base_config(args, chunk_size=cs, enable_speculative=(cs > 1)),
         duration=args.duration,
+        target_completed_requests=args.target_completed_requests,
     )
     runner.save_results(str(result_dir / "chunk_results.json"))
     runner.save_markdown_report(str(result_dir / "chunk_report.md"))

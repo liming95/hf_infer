@@ -24,15 +24,21 @@ class ExperimentRunner:
         duration: float = 30.0,
         baseline_config: Optional[SystemConfig] = None,
         window_sec: float = 1.0,
+        target_completed_requests: Optional[int] = None,
     ) -> Dict:
         simulator = BatchSDSimulator(config, seed=self.seed)
-        summary = simulator.run_simulation(duration_seconds=duration, verbose=False)
+        summary = simulator.run(
+            duration_seconds=None if target_completed_requests is not None else duration,
+            target_completed_requests=target_completed_requests,
+            verbose=False,
+        )
         windowed_metrics = simulator.get_windowed_metrics(window_sec=window_sec)
         baseline_summary = None
         deltas = None
         if baseline_config is not None:
-            baseline_summary = BatchSDSimulator(baseline_config, seed=self.seed).run_simulation(
-                duration_seconds=duration,
+            baseline_summary = BatchSDSimulator(baseline_config, seed=self.seed).run(
+                duration_seconds=None if target_completed_requests is not None else duration,
+                target_completed_requests=target_completed_requests,
                 verbose=False,
             )
             deltas = self._build_delta(summary, baseline_summary)
@@ -83,6 +89,7 @@ class ExperimentRunner:
         values: Iterable,
         config_builder,
         duration: float = 30.0,
+        target_completed_requests: Optional[int] = None,
     ) -> List[Dict]:
         print("\n" + "=" * 80)
         print(f"EXPERIMENT: {title}")
@@ -97,6 +104,7 @@ class ExperimentRunner:
                 config,
                 duration,
                 baseline_config=baseline_config,
+                target_completed_requests=target_completed_requests,
             )
             metrics = result["metrics"]
             delta = result["delta_vs_baseline"] or {}
@@ -129,7 +137,7 @@ class ExperimentRunner:
             real_compute_dtype=config.real_compute_dtype,
         )
 
-    def run_sweep_accept_rate(self, duration: float = 25.0) -> List[Dict]:
+    def run_sweep_accept_rate(self, duration: float = 25.0, target_completed_requests: Optional[int] = None) -> List[Dict]:
         return self._run_sweep(
             "SD Speedup Curve",
             [0.5, 0.6, 0.7, 0.8, 0.9, 0.98],
@@ -142,9 +150,10 @@ class ExperimentRunner:
                 workload_mode="mixed",
             ),
             duration,
+            target_completed_requests=target_completed_requests,
         )
 
-    def run_sweep_batch_size(self, duration: float = 25.0) -> List[Dict]:
+    def run_sweep_batch_size(self, duration: float = 25.0, target_completed_requests: Optional[int] = None) -> List[Dict]:
         return self._run_sweep(
             "Batch Size Impact",
             [4, 8, 16, 32],
@@ -157,9 +166,10 @@ class ExperimentRunner:
                 workload_mode="mixed",
             ),
             duration,
+            target_completed_requests=target_completed_requests,
         )
 
-    def run_sweep_chunk_size(self, duration: float = 25.0) -> List[Dict]:
+    def run_sweep_chunk_size(self, duration: float = 25.0, target_completed_requests: Optional[int] = None) -> List[Dict]:
         return self._run_sweep(
             "Chunk Size Granularity",
             [1, 2, 4, 8],
@@ -173,9 +183,10 @@ class ExperimentRunner:
                 workload_mode="mixed",
             ),
             duration,
+            target_completed_requests=target_completed_requests,
         )
 
-    def run_sweep_arrival_rate(self, duration: float = 25.0) -> List[Dict]:
+    def run_sweep_arrival_rate(self, duration: float = 25.0, target_completed_requests: Optional[int] = None) -> List[Dict]:
         return self._run_sweep(
             "Load Impact",
             [5.0, 10.0, 20.0, 30.0, 40.0],
@@ -188,9 +199,10 @@ class ExperimentRunner:
                 workload_mode="mixed",
             ),
             duration,
+            target_completed_requests=target_completed_requests,
         )
 
-    def run_stability_boundary(self, duration: float = 30.0) -> List[Dict]:
+    def run_stability_boundary(self, duration: float = 30.0, target_completed_requests: Optional[int] = None) -> List[Dict]:
         points = [
             (8, 2),
             (8, 4),
@@ -213,6 +225,7 @@ class ExperimentRunner:
                 workload_mode="rollout_burst",
             ),
             duration,
+            target_completed_requests=target_completed_requests,
         )
 
     def save_results(self, filename: str = "sim_results.json") -> None:
@@ -371,6 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["all", "accept", "batch", "chunk", "arrival", "stability"],
     )
     parser.add_argument("--duration", type=float, default=25.0)
+    parser.add_argument("--target-completed-requests", type=int)
     parser.add_argument("--output-json", default="sim_results.json")
     parser.add_argument("--output-md", default="sim_report.md")
     parser.add_argument("--output-csv", default="sim_summary.csv")
@@ -384,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accept-rate", type=float, default=0.85)
     parser.add_argument("--avg-prompt-len", type=int, default=50)
     parser.add_argument("--avg-max-tokens", type=int, default=200)
-    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "mixed"])
+    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "rollout_pull", "mixed"])
     return parser
 
 
@@ -408,9 +422,9 @@ def main() -> None:
     _override_runner_configs(runner, args)
 
     if args.suite in ("all", "accept"):
-        runner.run_sweep_accept_rate(duration=args.duration)
+        runner.run_sweep_accept_rate(duration=args.duration, target_completed_requests=args.target_completed_requests)
     if args.suite in ("all", "batch"):
-        runner.run_sweep_batch_size(duration=args.duration)
+        runner.run_sweep_batch_size(duration=args.duration, target_completed_requests=args.target_completed_requests)
     if args.suite in ("all", "chunk"):
         runner._run_sweep(
             "Chunk Size Granularity",
@@ -431,11 +445,12 @@ def main() -> None:
                 real_compute_dtype=args.dtype,
             ),
             args.duration,
+            target_completed_requests=args.target_completed_requests,
         )
     if args.suite in ("all", "arrival"):
-        runner.run_sweep_arrival_rate(duration=args.duration)
+        runner.run_sweep_arrival_rate(duration=args.duration, target_completed_requests=args.target_completed_requests)
     if args.suite in ("all", "stability"):
-        runner.run_stability_boundary(duration=args.duration)
+        runner.run_stability_boundary(duration=args.duration, target_completed_requests=args.target_completed_requests)
     if args.suite == "all":
         baseline_comparison(duration=args.duration)
 

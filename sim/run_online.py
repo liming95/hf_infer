@@ -11,6 +11,7 @@ from simulator import BatchSDSimulator, SystemConfig
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run async rollout + SD simulator with proxy or real HF compute.")
     parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument("--target-completed-requests", type=int)
     parser.add_argument("--arrival-rate", type=float, default=10.0)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-concurrent", type=int, default=48)
@@ -18,8 +19,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accept-rate", type=float, default=0.85)
     parser.add_argument("--avg-prompt-len", type=int, default=50)
     parser.add_argument("--avg-max-tokens", type=int, default=200)
-    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "mixed"])
+    parser.add_argument("--workload-mode", default="mixed", choices=["poisson", "rollout_burst", "rollout_pull", "mixed"])
     parser.add_argument("--rollout-burst-size", type=int, default=8)
+    parser.add_argument("--rollout-pull-batch-size", type=int, default=8)
+    parser.add_argument("--rollout-pull-target-outstanding", type=int, default=16)
     parser.add_argument("--gpu-memory-mb", type=float, default=12000)
     parser.add_argument("--use-real-compute", action="store_true")
     parser.add_argument("--model", dest="model_name_or_path")
@@ -48,6 +51,8 @@ def main() -> None:
         avg_max_tokens=args.avg_max_tokens,
         workload_mode=args.workload_mode,
         rollout_burst_size=args.rollout_burst_size,
+        rollout_pull_batch_size=args.rollout_pull_batch_size,
+        rollout_pull_target_outstanding=args.rollout_pull_target_outstanding,
         gpu_memory_mb=args.gpu_memory_mb,
         benchmark_table_path=args.benchmark_table_path,
         enable_speculative=not args.disable_speculative,
@@ -57,7 +62,12 @@ def main() -> None:
         real_compute_dtype=args.dtype,
     )
     simulator = BatchSDSimulator(config, seed=42)
-    summary = simulator.run_simulation(duration_seconds=args.duration, verbose=args.verbose)
+    duration = None if args.target_completed_requests is not None else args.duration
+    summary = simulator.run(
+        duration_seconds=duration,
+        target_completed_requests=args.target_completed_requests,
+        verbose=args.verbose,
+    )
     windowed_metrics = simulator.get_windowed_metrics(window_sec=args.window_sec)
     payload = {
         "summary": summary,

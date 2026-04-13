@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-json")
     parser.add_argument("--output-trace-json")
     parser.add_argument("--output-window-json")
+    parser.add_argument("--output-oom-json")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -67,6 +68,8 @@ def main() -> None:
             json.dump(payload, handle, indent=2)
     if args.output_trace_json:
         simulator.export_step_traces(args.output_trace_json)
+    if args.output_oom_json:
+        simulator.export_oom_events(args.output_oom_json)
     if args.output_window_json:
         with open(args.output_window_json, "w", encoding="utf-8") as handle:
             json.dump(windowed_metrics, handle, indent=2)

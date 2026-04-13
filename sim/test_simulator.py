@@ -272,14 +272,16 @@ class TestBatchScheduler(unittest.TestCase):
     def test_scheduler_creation(self):
         config = SystemConfig()
         kv_manager = KVCacheManager(config)
-        scheduler = BatchScheduler(config, kv_manager)
+        model = ComputeModel(config)
+        scheduler = BatchScheduler(config, kv_manager, model)
         
         self.assertEqual(len(scheduler.queue), 0)
     
     def test_add_request(self):
         config = SystemConfig()
         kv_manager = KVCacheManager(config)
-        scheduler = BatchScheduler(config, kv_manager)
+        model = ComputeModel(config)
+        scheduler = BatchScheduler(config, kv_manager, model)
         
         req = Request(
             request_id=0,
@@ -293,9 +295,14 @@ class TestBatchScheduler(unittest.TestCase):
         self.assertEqual(len(scheduler.queue), 1)
     
     def test_schedule_batch(self):
-        config = SystemConfig(max_batch_size=16, gpu_memory_mb=1000)
+        config = SystemConfig(
+            max_batch_size=16,
+            gpu_memory_mb=12000,
+            compute_memory_margin_mb=128,
+        )
         kv_manager = KVCacheManager(config)
-        scheduler = BatchScheduler(config, kv_manager)
+        model = ComputeModel(config)
+        scheduler = BatchScheduler(config, kv_manager, model)
         
         # Add multiple requests
         for i in range(10):
@@ -312,6 +319,33 @@ class TestBatchScheduler(unittest.TestCase):
         batch = scheduler.schedule()
         self.assertGreater(len(batch), 0)
         self.assertLessEqual(len(batch), config.max_batch_size)
+
+    def test_memory_headroom_affects_schedule(self):
+        config = SystemConfig(
+            max_batch_size=16,
+            gpu_memory_mb=5000,
+            model_weights_mb=1000,
+            activation_buffer_mb=1000,
+            runtime_overhead_mb=500,
+            compute_memory_margin_mb=2600,
+        )
+        kv_manager = KVCacheManager(config)
+        model = ComputeModel(config)
+        scheduler = BatchScheduler(config, kv_manager, model)
+
+        for i in range(10):
+            req = Request(
+                request_id=i,
+                prompt_len=512,
+                max_new_tokens=1024,
+                arrival_time=0.0,
+                accept_rate=0.85,
+            )
+            self.assertTrue(kv_manager.allocate(req))
+            scheduler.add_request(req)
+
+        batch = scheduler.schedule()
+        self.assertLess(len(batch), 10)
 
 
 class TestSimulator(unittest.TestCase):
@@ -369,6 +403,7 @@ class TestSimulator(unittest.TestCase):
         self.assertGreater(len(windows), 0)
         self.assertIn("throughput_tokens_per_sec", windows[0])
         self.assertIn("avg_queue_size", windows[0])
+        self.assertIn("executed_chunk_size", sim.step_traces[0].__dict__)
     
     def test_non_speculative_mode(self):
         config = SystemConfig(

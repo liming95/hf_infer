@@ -23,7 +23,7 @@ from typing import Deque, Dict, List, Optional
 
 import numpy as np
 
-from executor import ExecutionMetrics, HFRealExecutor, ProxyExecutor
+from executor import ExecutionMetrics, HFRealExecutor, ProxyExecutor, RealComputeOOM
 
 
 @dataclass
@@ -90,9 +90,27 @@ class StepTrace:
     avg_seq_len: float
     avg_prompt_len: float
     executor_mode: str
+    requested_chunk_size: int
+    executed_chunk_size: int
+    oom_retries: int = 0
     memory_allocated_mb: float = 0.0
     peak_memory_allocated_mb: float = 0.0
     gpu_utilization: float = 0.0
+
+
+@dataclass
+class OOMEvent:
+    """Records one OOM event and the retry decision that followed."""
+
+    step_id: int
+    time: float
+    phase: str
+    requested_batch_size: int
+    requested_chunk_size: int
+    max_seq_len: int
+    retry_batch_size: int
+    retry_chunk_size: int
+    message: str
 
 
 @dataclass
@@ -127,6 +145,11 @@ class SystemConfig:
     model_name_or_path: Optional[str] = None
     real_compute_device: str = "cuda"
     real_compute_dtype: str = "float16"
+    compute_memory_margin_mb: float = 1024.0
+    prefill_activation_mb_per_token: float = 0.0025
+    decode_activation_mb_per_token: float = 0.0015
+    activation_scaling_exponent: float = 1.05
+    oom_retry_limit: int = 6
 
     enable_speculative: bool = True
     verify_parallelism: float = 0.32
@@ -360,6 +383,66 @@ class ComputeModel:
         )
         return latency
 
+    def estimate_prefill_extra_memory_mb(self, prompt_lengths: List[int]) -> float:
+        if not prompt_lengths:
+            return 0.0
+        batch_size = len(prompt_lengths)
+        max_prompt = max(prompt_lengths)
+        measured = None
+        if self.prefill_points:
+            point = min(
+                self.prefill_points,
+                key=lambda item: abs(item["batch_size"] - batch_size) + abs(item["prompt_len"] - max_prompt),
+            )
+            measured = float(point.get("max_memory_allocated_mb", 0.0) or point.get("memory_reserved_mb", 0.0) or 0.0)
+        if measured and measured > 0:
+            return measured
+        return (
+            self.config.compute_memory_margin_mb
+            + self.config.prefill_activation_mb_per_token
+            * batch_size
+            * max_prompt
+            * ((max_prompt / 128.0) ** max(0.0, self.config.activation_scaling_exponent - 1.0))
+        )
+
+    def estimate_decode_extra_memory_mb(self, seq_lengths: List[int], chunk_size: int) -> float:
+        if not seq_lengths:
+            return 0.0
+        batch_size = len(seq_lengths)
+        max_seq_len = max(seq_lengths)
+        measured = None
+        if self.decode_points:
+            point = min(
+                self.decode_points,
+                key=lambda item: (
+                    abs(item["batch_size"] - batch_size)
+                    + abs(item["seq_len"] - max_seq_len)
+                    + abs(item["chunk_size"] - chunk_size)
+                ),
+            )
+            measured = float(point.get("max_memory_allocated_mb", 0.0) or point.get("memory_reserved_mb", 0.0) or 0.0)
+        if measured and measured > 0:
+            return measured
+        return (
+            self.config.compute_memory_margin_mb
+            + self.config.decode_activation_mb_per_token
+            * batch_size
+            * max(chunk_size, 1)
+            * max_seq_len
+            * ((max_seq_len / 128.0) ** max(0.0, self.config.activation_scaling_exponent - 1.0))
+        )
+
+    def estimate_step_extra_memory_mb(
+        self,
+        prefill_prompt_lengths: List[int],
+        decode_seq_lengths: List[int],
+        chunk_size: int,
+    ) -> float:
+        return max(
+            self.estimate_prefill_extra_memory_mb(prefill_prompt_lengths),
+            self.estimate_decode_extra_memory_mb(decode_seq_lengths, chunk_size),
+        )
+
     def estimate_latency(self, batch_size: int, avg_seq_len: int) -> float:
         dummy_requests = [
             Request(
@@ -409,9 +492,10 @@ class SDAccepter:
 class BatchScheduler:
     """Selects a decode/prefill batch under batch and memory constraints."""
 
-    def __init__(self, config: SystemConfig, kv_manager: KVCacheManager):
+    def __init__(self, config: SystemConfig, kv_manager: KVCacheManager, compute_model: ComputeModel):
         self.config = config
         self.kv_manager = kv_manager
+        self.compute_model = compute_model
         self.queue: Deque[Request] = deque()
 
     def add_request(self, request: Request) -> None:
@@ -453,7 +537,15 @@ class BatchScheduler:
                 self.kv_manager.estimate_request_kv_mb(request.current_seq_len + projected_tokens)
                 - request.kv_cache_size
             )
-            if reserved_growth_mb + max(0.0, growth_mb) <= available_mb + 1e-9:
+            candidate_batch = batch + [request]
+            prefill_prompt_lengths = [r.prompt_len for r in candidate_batch if not r.prefill_done]
+            decode_seq_lengths = [r.current_seq_len for r in candidate_batch if r.prefill_done and not r.is_completed()]
+            compute_extra_mb = self.compute_model.estimate_step_extra_memory_mb(
+                prefill_prompt_lengths=prefill_prompt_lengths,
+                decode_seq_lengths=decode_seq_lengths,
+                chunk_size=max(1, self.config.chunk_size if self.config.enable_speculative else 1),
+            )
+            if reserved_growth_mb + max(0.0, growth_mb) + compute_extra_mb <= available_mb + 1e-9:
                 batch.append(request)
                 reserved_growth_mb += max(0.0, growth_mb)
 
@@ -467,8 +559,8 @@ class BatchSDSimulator:
         self.config = config
         self.request_gen = RequestGenerator(config, seed)
         self.kv_manager = KVCacheManager(config)
-        self.scheduler = BatchScheduler(config, self.kv_manager)
         self.compute_model = ComputeModel(config)
+        self.scheduler = BatchScheduler(config, self.kv_manager, self.compute_model)
         self.sd_accepter = SDAccepter(seed)
         self.executor = self._build_executor()
 
@@ -496,6 +588,7 @@ class BatchSDSimulator:
         self.queue_size_trace: List[int] = []
         self.execution_trace: List[ExecutionMetrics] = []
         self.step_traces: List[StepTrace] = []
+        self.oom_events: List[OOMEvent] = []
 
     def _build_executor(self):
         if self.config.use_real_compute:
@@ -548,6 +641,16 @@ class BatchSDSimulator:
     def _admit_requests(self) -> None:
         while self.waiting_requests and len(self.active_requests) < self.config.max_concurrent_requests:
             request = self.waiting_requests[0]
+            projected_kv_mb = self.kv_manager.estimate_request_kv_mb(request.current_seq_len)
+            projected_extra_mb = self.compute_model.estimate_step_extra_memory_mb(
+                prefill_prompt_lengths=[request.prompt_len],
+                decode_seq_lengths=[],
+                chunk_size=max(1, self.config.chunk_size if self.config.enable_speculative else 1),
+            )
+            total_if_admitted = self.kv_manager.total_kv_used_mb + projected_kv_mb + projected_extra_mb
+            if total_if_admitted > self.config.kv_budget_mb + 1e-9:
+                self.total_blocked_admissions += 1
+                break
             if not self.kv_manager.allocate(request):
                 self.total_blocked_admissions += 1
                 break
@@ -560,16 +663,73 @@ class BatchSDSimulator:
 
     def _process_batch(self, batch: List[Request], verbose: bool) -> float:
         step_start_time = self.current_time
+        effective_batch = list(batch)
+        requested_chunk_size = max(1, self.config.chunk_size if self.config.enable_speculative else 1)
+        executed_chunk_size = requested_chunk_size
+        oom_retries = 0
+
+        while True:
+            prefill_requests = [r for r in effective_batch if not r.prefill_done]
+            decode_requests = [r for r in effective_batch if r.prefill_done and not r.is_completed()]
+
+            try:
+                prefill_metrics = self.executor.prefill([r.prompt_len for r in prefill_requests])
+                prefill_latency_ms = prefill_metrics.latency_ms
+                verify_width = 1.0
+                if decode_requests:
+                    verify_width = mean(
+                        min(r.remaining_tokens(), executed_chunk_size)
+                        for r in decode_requests
+                    )
+                decode_metrics = self.executor.decode(
+                    [r.current_seq_len for r in decode_requests],
+                    max(1, int(round(verify_width))),
+                )
+                decode_latency_ms = decode_metrics.latency_ms
+                break
+            except RealComputeOOM as exc:
+                oom_retries += 1
+                retry_batch_size = len(effective_batch)
+                retry_chunk_size = executed_chunk_size
+                if executed_chunk_size > 1:
+                    retry_chunk_size = max(1, executed_chunk_size // 2)
+                    if retry_chunk_size == executed_chunk_size:
+                        retry_chunk_size = max(1, executed_chunk_size - 1)
+                    executed_chunk_size = retry_chunk_size
+                elif len(effective_batch) > 1:
+                    retry_batch_size = max(1, len(effective_batch) // 2)
+                    effective_batch = sorted(
+                        effective_batch,
+                        key=lambda r: (r.current_seq_len, r.remaining_tokens(), r.arrival_time),
+                    )[:retry_batch_size]
+                else:
+                    raise
+
+                self.oom_events.append(
+                    OOMEvent(
+                        step_id=self.total_compute_steps + 1,
+                        time=self.current_time,
+                        phase=exc.phase,
+                        requested_batch_size=exc.batch_size,
+                        requested_chunk_size=exc.chunk_size if exc.chunk_size > 0 else requested_chunk_size,
+                        max_seq_len=exc.max_seq_len,
+                        retry_batch_size=len(effective_batch),
+                        retry_chunk_size=executed_chunk_size,
+                        message=str(exc),
+                    )
+                )
+                if oom_retries >= self.config.oom_retry_limit:
+                    raise RuntimeError(
+                        f"Exceeded oom_retry_limit={self.config.oom_retry_limit} while trying to execute a real HF step"
+                    ) from exc
+
+        batch = effective_batch
+        prefill_requests = [r for r in batch if not r.prefill_done]
+        decode_requests = [r for r in batch if r.prefill_done and not r.is_completed()]
         self.total_batches += 1
         self.total_compute_steps += 1
         self.total_batch_size_acc += len(batch)
         self.batch_size_trace.append(len(batch))
-
-        prefill_requests = [r for r in batch if not r.prefill_done]
-        decode_requests = [r for r in batch if r.prefill_done and not r.is_completed()]
-
-        prefill_metrics = self.executor.prefill([r.prompt_len for r in prefill_requests])
-        prefill_latency_ms = prefill_metrics.latency_ms
         if prefill_requests:
             self.total_prefill_time_ms += prefill_latency_ms
             self.execution_trace.append(prefill_metrics)
@@ -577,22 +737,13 @@ class BatchSDSimulator:
                 request.prefill_done = True
                 if request.decode_start_time is None:
                     request.decode_start_time = self.current_time
-
-        verify_width = 1.0
-        if decode_requests:
-            verify_width = mean(
-                min(r.remaining_tokens(), max(1, self.config.chunk_size))
-                for r in decode_requests
-            )
-        decode_metrics = self.executor.decode([r.current_seq_len for r in decode_requests], max(1, int(round(verify_width))))
-        decode_latency_ms = decode_metrics.latency_ms
         self.total_decode_time_ms += decode_latency_ms
         if decode_requests:
             self.execution_trace.append(decode_metrics)
 
         for request in decode_requests:
             remaining = request.remaining_tokens()
-            proposed_tokens = min(remaining, max(1, self.config.chunk_size))
+            proposed_tokens = min(remaining, executed_chunk_size)
             if self.config.enable_speculative:
                 accepted_tokens = self.sd_accepter.accept_tokens(request, proposed_tokens)
                 fallback_token = 1 if accepted_tokens < proposed_tokens and remaining > accepted_tokens else 0
@@ -690,6 +841,9 @@ class BatchSDSimulator:
                 avg_seq_len=float(mean([r.current_seq_len for r in batch])) if batch else 0.0,
                 avg_prompt_len=float(mean([r.prompt_len for r in prefill_requests])) if prefill_requests else 0.0,
                 executor_mode="real_hf" if self.config.use_real_compute else "proxy",
+                requested_chunk_size=requested_chunk_size,
+                executed_chunk_size=executed_chunk_size,
+                oom_retries=oom_retries,
                 memory_allocated_mb=step_memory_allocated_mb,
                 peak_memory_allocated_mb=step_peak_memory_allocated_mb,
                 gpu_utilization=step_gpu_utilization,
@@ -701,6 +855,10 @@ class BatchSDSimulator:
     def export_step_traces(self, path: str) -> None:
         with open(path, "w", encoding="utf-8") as handle:
             json.dump([asdict(item) for item in self.step_traces], handle, indent=2)
+
+    def export_oom_events(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([asdict(item) for item in self.oom_events], handle, indent=2)
 
     def _counter_delta(self, traces: List[StepTrace], field_name: str) -> float:
         if not traces:
@@ -744,6 +902,9 @@ class BatchSDSimulator:
                         "avg_step_latency_ms": float(np.mean([trace.total_latency_ms for trace in traces])),
                         "avg_prefill_latency_ms": float(np.mean([trace.prefill_latency_ms for trace in traces])),
                         "avg_decode_latency_ms": float(np.mean([trace.decode_latency_ms for trace in traces])),
+                        "avg_requested_chunk_size": float(np.mean([trace.requested_chunk_size for trace in traces])),
+                        "avg_executed_chunk_size": float(np.mean([trace.executed_chunk_size for trace in traces])),
+                        "oom_retries": int(sum(trace.oom_retries for trace in traces)),
                         "throughput_tokens_per_sec": self._counter_delta(traces, "committed_tokens") / duration,
                         "accepted_tokens_per_sec": self._counter_delta(traces, "accepted_draft_tokens") / duration,
                         "rejected_tokens_per_sec": self._counter_delta(traces, "rejected_draft_tokens") / duration,
@@ -814,6 +975,13 @@ class BatchSDSimulator:
                 [m.max_memory_allocated_mb for m in self.execution_trace],
                 default=0.0,
             ),
+            "oom_events_count": len(self.oom_events),
+            "oom_retry_count": int(sum(event.retry_chunk_size != event.requested_chunk_size or event.retry_batch_size != event.requested_batch_size for event in self.oom_events)),
+            "oom_events_by_requested_chunk": {
+                str(chunk): sum(1 for event in self.oom_events if event.requested_chunk_size == chunk)
+                for chunk in sorted({event.requested_chunk_size for event in self.oom_events})
+            },
+            "avg_executed_chunk_size": float(np.mean([trace.executed_chunk_size for trace in self.step_traces])) if self.step_traces else 0.0,
             "executor_mode": "real_hf" if self.config.use_real_compute else "proxy",
             "stability_ratio": len(self.completed_requests) / max(self.total_arrived_requests, 1),
             "queue_backlog_ratio": len(self.waiting_requests) / max(self.total_arrived_requests, 1),

@@ -97,6 +97,7 @@ def run_pipeline(args) -> Path:
     _write_json(result_dir / "online_summary.json", summary)
     _write_json(result_dir / "online_window_metrics.json", windowed_metrics)
     simulator.export_step_traces(str(result_dir / "online_step_trace.json"))
+    simulator.export_oom_events(str(result_dir / "online_oom_events.json"))
 
     runner = ExperimentRunner(seed=args.seed)
     runner._run_sweep(

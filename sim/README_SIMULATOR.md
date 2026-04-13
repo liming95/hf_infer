@@ -311,6 +311,7 @@ sim/results/<run_name>/
   online_summary.json
   online_window_metrics.json
   online_step_trace.json
+  online_oom_events.json
   chunk_results.json
   chunk_report.md
   chunk_summary.csv
@@ -327,6 +328,17 @@ sim/results/<run_name>/
     online_step_kv_and_gpu.png
     online_step_memory.png
 ```
+
+`online_oom_events.json` records each real-compute OOM, including:
+
+- requested batch size
+- requested chunk size
+- maximum sequence length at the time of failure
+- retry batch size
+- retry chunk size
+
+This is intended specifically for analyzing how `chunk_size` changes influence
+OOM risk in `real_hf` mode.
 
 ### Disable Speculative Decoding for Baseline
 

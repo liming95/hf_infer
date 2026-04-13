@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Protocol
@@ -31,6 +32,17 @@ class ExecutorBackend(Protocol):
 
     def decode(self, seq_lengths: List[int], chunk_size: int) -> ExecutionMetrics:
         ...
+
+
+class RealComputeOOM(RuntimeError):
+    """Raised when the real HF backend hits CUDA OOM."""
+
+    def __init__(self, phase: str, batch_size: int, max_seq_len: int, chunk_size: int, message: str):
+        super().__init__(message)
+        self.phase = phase
+        self.batch_size = batch_size
+        self.max_seq_len = max_seq_len
+        self.chunk_size = chunk_size
 
 
 class ProxyExecutor:
@@ -104,6 +116,16 @@ class HFRealExecutor:
         ).to(device)
         self.model.eval()
         self.vocab_size = int(self.model.config.vocab_size)
+        self.forward_signature = inspect.signature(self.model.forward)
+
+    def _last_logits_kwargs(self) -> dict:
+        kwargs = {}
+        parameters = self.forward_signature.parameters
+        if "logits_to_keep" in parameters:
+            kwargs["logits_to_keep"] = 1
+        elif "num_logits_to_keep" in parameters:
+            kwargs["num_logits_to_keep"] = 1
+        return kwargs
 
     def _rand_ids(self, batch_size: int, seq_len: int):
         torch = self.torch
@@ -119,14 +141,29 @@ class HFRealExecutor:
         mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=self.device)
         return ids, mask
 
-    def _measure(self, fn):
+    def _measure(self, fn, phase: str, batch_size: int, max_seq_len: int, chunk_size: int):
         torch = self.torch
         if self.device.startswith("cuda"):
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
         start = time.perf_counter()
-        fn()
+        try:
+            fn()
+        except torch.OutOfMemoryError as exc:
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            raise RealComputeOOM(
+                phase=phase,
+                batch_size=batch_size,
+                max_seq_len=max_seq_len,
+                chunk_size=chunk_size,
+                message=(
+                    "HFRealExecutor hit CUDA OOM during real compute. "
+                    "Try reducing batch_size, max_concurrent, avg_prompt_len, avg_max_tokens, or chunk_size. "
+                    "For long-sequence runs, start with smaller values and scale up gradually."
+                ),
+            ) from exc
         if self.device.startswith("cuda"):
             torch.cuda.synchronize()
             allocated = torch.cuda.memory_allocated() / (1024 * 1024)
@@ -146,16 +183,24 @@ class HFRealExecutor:
         max_prompt = max(prompt_lengths)
         input_ids, attention_mask = self._rand_ids(batch_size, max_prompt)
         torch = self.torch
+        logits_kwargs = self._last_logits_kwargs()
 
-        @torch.no_grad()
+        @torch.inference_mode()
         def run():
             self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 use_cache=True,
+                **logits_kwargs,
             )
 
-        latency_ms, allocated, peak_alloc, reserved = self._measure(run)
+        latency_ms, allocated, peak_alloc, reserved = self._measure(
+            run,
+            phase="prefill",
+            batch_size=batch_size,
+            max_seq_len=max_prompt,
+            chunk_size=0,
+        )
         return ExecutionMetrics(
             phase="prefill",
             latency_ms=latency_ms,
@@ -176,24 +221,37 @@ class HFRealExecutor:
         prefix_ids, prefix_mask = self._rand_ids(batch_size, max_seq)
         next_ids, _ = self._rand_ids(batch_size, max(1, chunk_size))
         torch = self.torch
+        logits_kwargs = self._last_logits_kwargs()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             prefill_outputs = self.model(
                 input_ids=prefix_ids,
                 attention_mask=prefix_mask,
                 use_cache=True,
+                **logits_kwargs,
             )
             past_key_values = prefill_outputs.past_key_values
+            del prefill_outputs
 
-        @torch.no_grad()
+        @torch.inference_mode()
         def run():
             self.model(
                 input_ids=next_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
+                **logits_kwargs,
             )
 
-        latency_ms, allocated, peak_alloc, reserved = self._measure(run)
+        latency_ms, allocated, peak_alloc, reserved = self._measure(
+            run,
+            phase="decode",
+            batch_size=batch_size,
+            max_seq_len=max_seq,
+            chunk_size=max(1, chunk_size),
+        )
+        del past_key_values
+        if self.device.startswith("cuda"):
+            torch.cuda.empty_cache()
         return ExecutionMetrics(
             phase="decode",
             latency_ms=latency_ms,

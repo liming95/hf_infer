@@ -146,6 +146,8 @@ class SystemConfig:
     arrival_rate: float = 10.0
     avg_prompt_len: int = 50
     avg_max_tokens: int = 200
+    fixed_prompt_len: bool = False
+    fixed_max_tokens: bool = False
     avg_accept_rate: float = 0.8
     workload_mode: str = "poisson"  # poisson | rollout_burst | rollout_pull | mixed
     rollout_burst_size: int = 8
@@ -202,12 +204,16 @@ class RequestGenerator:
 
     def _sample_prompt_len(self) -> int:
         base = self.config.avg_prompt_len
+        if self.config.fixed_prompt_len:
+            return max(8, int(base))
         if self.np_rng.rand() < self.config.long_request_ratio:
             base *= 3
         return max(8, int(self.np_rng.poisson(base)))
 
     def _sample_generation_len(self) -> int:
         base = self.config.avg_max_tokens
+        if self.config.fixed_max_tokens:
+            return max(16, int(base))
         if self.np_rng.rand() < self.config.long_request_ratio:
             base *= 2
         return max(16, int(self.np_rng.poisson(base)))

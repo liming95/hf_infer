@@ -306,7 +306,7 @@ python sim/run_rollout_hf_sweep.py \
   --model /path/to/model \
   --run-name rollout_hf_grid \
   --target-completed-requests 64 \
-  --prompt-len 1024 \
+  --prompt-lens 256,1024,2048 \
   --batch-sizes 4,8,16 \
   --max-token-lens 256,1024,2048 \
   --chunk-sizes 1,2,4,8,16 \
@@ -334,6 +334,7 @@ sim/results/rollout_hf_grid/
 The default grid is already fairly large:
 
 - batch sizes: `4,8,16`
+- prompt lengths: use `--prompt-lens`; recommended starter values are `256,1024,2048`
 - max token lengths: `256,1024,2048`
 - chunk sizes: `1,2,4,8,16`
 - SD rates: `0.60,0.75,0.90`
@@ -362,6 +363,14 @@ If you want full per-step traces for every config, add:
 
 That can create large files, so it is off by default.
 
+By default this sweep uses fixed prompt and max-generation lengths for cleaner
+hardware comparisons. If you want Poisson-random prompt and generation lengths
+around each configured value, add:
+
+```bash
+--random-lengths
+```
+
 For long `nohup` sweeps, add `--continue-on-error` so one failed configuration
 does not stop the whole grid:
 
@@ -370,7 +379,7 @@ nohup python sim/run_rollout_hf_sweep.py \
   --model /workspace/models/Qwen2.5-1.5B-Instruct \
   --run-name rollout_hf_grid \
   --target-completed-requests 64 \
-  --prompt-len 1024 \
+  --prompt-lens 256,1024,2048 \
   --batch-sizes 4,8,16 \
   --max-token-lens 256,1024,2048 \
   --chunk-sizes 1,2,4,8,16 \

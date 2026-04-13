@@ -45,7 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration", type=float, default=None, help="Optional safety cap. Usually omit for rollout mode.")
     parser.add_argument("--window-sec", type=float, default=1.0)
 
-    parser.add_argument("--prompt-len", type=int, default=1024)
+    parser.add_argument("--prompt-len", type=int, default=1024, help="Backward-compatible single prompt length.")
+    parser.add_argument("--prompt-lens", default=None, help="Comma-separated prompt lengths, e.g. 256,1024,2048.")
     parser.add_argument("--batch-sizes", default="4,8,16")
     parser.add_argument("--max-token-lens", default="256,1024,2048")
     parser.add_argument("--chunk-sizes", default="1,2,4,8,16")
@@ -57,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-mb", type=float, default=48000)
     parser.add_argument("--compute-memory-margin-mb", type=float, default=4096)
     parser.add_argument("--chunk1-as-baseline", action="store_true", default=True)
+    parser.add_argument("--random-lengths", action="store_true", help="Use Poisson prompt/max-token sampling instead of fixed sweep lengths.")
 
     parser.add_argument("--limit", type=int, help="Run only the first N configurations.")
     parser.add_argument("--dry-run", action="store_true")
@@ -68,25 +70,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def iter_configs(args):
     batch_sizes = _int_list(args.batch_sizes)
+    prompt_lens = _int_list(args.prompt_lens) if args.prompt_lens else [args.prompt_len]
     max_token_lens = _int_list(args.max_token_lens)
     chunk_sizes = _int_list(args.chunk_sizes)
     sd_rates = _float_list(args.sd_rates)
 
     configs = []
     for batch_size in batch_sizes:
-        for max_tokens in max_token_lens:
-            for chunk_size in chunk_sizes:
-                rates = [1.0] if chunk_size == 1 and args.chunk1_as_baseline else sd_rates
-                for sd_rate in rates:
-                    configs.append(
-                        {
-                            "batch_size": batch_size,
-                            "max_tokens": max_tokens,
-                            "chunk_size": chunk_size,
-                            "sd_rate": sd_rate,
-                            "enable_speculative": chunk_size > 1,
-                        }
-                    )
+        for prompt_len in prompt_lens:
+            for max_tokens in max_token_lens:
+                for chunk_size in chunk_sizes:
+                    rates = [1.0] if chunk_size == 1 and args.chunk1_as_baseline else sd_rates
+                    for sd_rate in rates:
+                        configs.append(
+                            {
+                                "batch_size": batch_size,
+                                "prompt_len": prompt_len,
+                                "max_tokens": max_tokens,
+                                "chunk_size": chunk_size,
+                                "sd_rate": sd_rate,
+                                "enable_speculative": chunk_size > 1,
+                            }
+                        )
     if args.limit is not None:
         configs = configs[: args.limit]
     return configs
@@ -102,8 +107,10 @@ def build_system_config(args, item: dict) -> SystemConfig:
         max_concurrent_requests=max(batch_size, batch_size * args.max_concurrent_factor),
         chunk_size=item["chunk_size"],
         avg_accept_rate=item["sd_rate"],
-        avg_prompt_len=args.prompt_len,
+        avg_prompt_len=item["prompt_len"],
         avg_max_tokens=item["max_tokens"],
+        fixed_prompt_len=not args.random_lengths,
+        fixed_max_tokens=not args.random_lengths,
         enable_speculative=item["enable_speculative"],
         gpu_memory_mb=args.gpu_memory_mb,
         compute_memory_margin_mb=args.compute_memory_margin_mb,
@@ -117,7 +124,7 @@ def build_system_config(args, item: dict) -> SystemConfig:
 def flatten_summary(item: dict, summary: dict) -> dict:
     return {
         "batch_size": item["batch_size"],
-        "prompt_len": item.get("prompt_len"),
+        "prompt_len": item["prompt_len"],
         "max_tokens": item["max_tokens"],
         "chunk_size": item["chunk_size"],
         "sd_rate": item["sd_rate"],
@@ -202,10 +209,10 @@ def write_report(path: Path, rows: List[dict]) -> None:
             [
                 "## Key Points",
                 "",
-                f"- Best throughput config: batch={best['batch_size']}, max_tokens={best['max_tokens']}, "
+                f"- Best throughput config: batch={best['batch_size']}, prompt_len={best['prompt_len']}, max_tokens={best['max_tokens']}, "
                 f"chunk={best['chunk_size']}, sd_rate={best['sd_rate']} -> "
                 f"{best['throughput_tokens_per_sec']:.2f} tokens/sec",
-                f"- Most OOM-prone config: batch={worst_oom['batch_size']}, max_tokens={worst_oom['max_tokens']}, "
+                f"- Most OOM-prone config: batch={worst_oom['batch_size']}, prompt_len={worst_oom['prompt_len']}, max_tokens={worst_oom['max_tokens']}, "
                 f"chunk={worst_oom['chunk_size']}, sd_rate={worst_oom['sd_rate']} -> "
                 f"{worst_oom['oom_events_count']} OOM events",
                 "",
@@ -215,7 +222,7 @@ def write_report(path: Path, rows: List[dict]) -> None:
         )
         for row in rows:
             lines.append(
-                f"- batch={row['batch_size']}, max_tokens={row['max_tokens']}, chunk={row['chunk_size']}, "
+                f"- batch={row['batch_size']}, prompt_len={row['prompt_len']}, max_tokens={row['max_tokens']}, chunk={row['chunk_size']}, "
                 f"sd_rate={row['sd_rate']}: throughput={row['throughput_tokens_per_sec']:.2f}, "
                 f"lat={row['avg_request_latency_sec']:.3f}s, p95={row['p95_request_latency_sec']:.3f}s, "
                 f"oom={row['oom_events_count']}, executed_chunk={row['avg_executed_chunk_size']:.2f}"
@@ -245,7 +252,15 @@ def _pick_middle(values: List):
     return values[len(values) // 2]
 
 
-def plot_metric_vs_chunk(rows: List[dict], plot_dir: Path, fixed_batch_size: int, metric: str, ylabel: str, filename: str) -> str:
+def plot_metric_vs_chunk(
+    rows: List[dict],
+    plot_dir: Path,
+    fixed_batch_size: int,
+    fixed_prompt_len: int,
+    metric: str,
+    ylabel: str,
+    filename: str,
+) -> str:
     rows = [row for row in rows if row.get("status") == "ok"]
     if not rows:
         return f"{filename}: skipped because all rows failed."
@@ -257,7 +272,13 @@ def plot_metric_vs_chunk(rows: List[dict], plot_dir: Path, fixed_batch_size: int
     fig, ax = plt.subplots(figsize=(10, 6))
     for max_tokens in max_tokens_values:
         points = sorted(
-            filter_rows(rows, batch_size=fixed_batch_size, max_tokens=max_tokens, sd_rate=fixed_sd_rate),
+            filter_rows(
+                rows,
+                batch_size=fixed_batch_size,
+                prompt_len=fixed_prompt_len,
+                max_tokens=max_tokens,
+                sd_rate=fixed_sd_rate,
+            ),
             key=lambda item: item["chunk_size"],
         )
         if not points:
@@ -277,11 +298,11 @@ def plot_metric_vs_chunk(rows: List[dict], plot_dir: Path, fixed_batch_size: int
     _save_plot(fig, plot_dir / filename)
     return (
         f"{filename}: x-axis varies `chunk_size`; lines vary `max_tokens`. "
-        f"Fixed constants: batch_size={fixed_batch_size}, sd_rate={fixed_sd_rate}, prompt_len is configured globally."
+        f"Fixed constants: batch_size={fixed_batch_size}, prompt_len={fixed_prompt_len}, sd_rate={fixed_sd_rate}."
     )
 
 
-def plot_metric_vs_batch(rows: List[dict], plot_dir: Path, fixed_max_tokens: int, fixed_sd_rate: float) -> str:
+def plot_metric_vs_batch(rows: List[dict], plot_dir: Path, fixed_prompt_len: int, fixed_max_tokens: int, fixed_sd_rate: float) -> str:
     rows = [row for row in rows if row.get("status") == "ok"]
     if not rows:
         return "throughput_vs_batch_by_chunk.png: skipped because all rows failed."
@@ -289,7 +310,13 @@ def plot_metric_vs_batch(rows: List[dict], plot_dir: Path, fixed_max_tokens: int
     fig, ax = plt.subplots(figsize=(10, 6))
     for chunk_size in chunk_sizes:
         points = sorted(
-            filter_rows(rows, max_tokens=fixed_max_tokens, chunk_size=chunk_size, sd_rate=fixed_sd_rate),
+            filter_rows(
+                rows,
+                prompt_len=fixed_prompt_len,
+                max_tokens=fixed_max_tokens,
+                chunk_size=chunk_size,
+                sd_rate=fixed_sd_rate,
+            ),
             key=lambda item: item["batch_size"],
         )
         if not points:
@@ -310,7 +337,7 @@ def plot_metric_vs_batch(rows: List[dict], plot_dir: Path, fixed_max_tokens: int
     _save_plot(fig, plot_dir / filename)
     return (
         f"{filename}: x-axis varies `batch_size`; lines vary `chunk_size`. "
-        f"Fixed constants: max_tokens={fixed_max_tokens}, sd_rate={fixed_sd_rate}, prompt_len is configured globally."
+        f"Fixed constants: prompt_len={fixed_prompt_len}, max_tokens={fixed_max_tokens}, sd_rate={fixed_sd_rate}."
     )
 
 
@@ -375,18 +402,21 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     batch_sizes = unique_values(ok_rows, "batch_size")
+    prompt_lens = unique_values(ok_rows, "prompt_len")
     max_tokens_values = unique_values(ok_rows, "max_tokens")
     sd_rates = [value for value in unique_values(ok_rows, "sd_rate") if value < 1.0]
     fixed_batch_size = _pick_middle(batch_sizes)
+    fixed_prompt_len = _pick_middle(prompt_lens)
     fixed_max_tokens = _pick_middle(max_tokens_values)
     fixed_sd_rate = _pick_middle(sd_rates) if sd_rates else unique_values(rows, "sd_rate")[0]
 
     descriptions = [
-        f"Global prompt_len={prompt_len}.",
+        f"Default prompt_len argument={prompt_len}. The sweep may include multiple prompt_len values.",
         plot_metric_vs_chunk(
             ok_rows,
             plot_dir,
             fixed_batch_size=fixed_batch_size,
+            fixed_prompt_len=fixed_prompt_len,
             metric="throughput_tokens_per_sec",
             ylabel="throughput_tokens_per_sec",
             filename="throughput_vs_chunk_by_max_tokens.png",
@@ -395,6 +425,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             ok_rows,
             plot_dir,
             fixed_batch_size=fixed_batch_size,
+            fixed_prompt_len=fixed_prompt_len,
             metric="avg_request_latency_sec",
             ylabel="avg_request_latency_sec",
             filename="latency_vs_chunk_by_max_tokens.png",
@@ -402,6 +433,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
         plot_metric_vs_batch(
             ok_rows,
             plot_dir,
+            fixed_prompt_len=fixed_prompt_len,
             fixed_max_tokens=fixed_max_tokens,
             fixed_sd_rate=fixed_sd_rate,
         ),
@@ -411,7 +443,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             x_key="chunk_size",
             y_key="batch_size",
             metric="oom_events_count",
-            fixed={"max_tokens": fixed_max_tokens, "sd_rate": fixed_sd_rate},
+            fixed={"prompt_len": fixed_prompt_len, "max_tokens": fixed_max_tokens, "sd_rate": fixed_sd_rate},
             filename="oom_count_heatmap_batch_chunk.png",
             title="OOM count by batch size and chunk size",
         ),
@@ -421,7 +453,7 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             x_key="chunk_size",
             y_key="sd_rate",
             metric="throughput_tokens_per_sec",
-            fixed={"batch_size": fixed_batch_size, "max_tokens": fixed_max_tokens},
+            fixed={"batch_size": fixed_batch_size, "prompt_len": fixed_prompt_len, "max_tokens": fixed_max_tokens},
             filename="throughput_heatmap_chunk_sd_rate.png",
             title="Throughput by chunk size and SD rate",
         ),
@@ -431,9 +463,19 @@ def generate_plots(result_dir: Path, rows: List[dict], prompt_len: int) -> None:
             x_key="chunk_size",
             y_key="max_tokens",
             metric="throughput_tokens_per_sec",
-            fixed={"batch_size": fixed_batch_size, "sd_rate": fixed_sd_rate},
+            fixed={"batch_size": fixed_batch_size, "prompt_len": fixed_prompt_len, "sd_rate": fixed_sd_rate},
             filename="throughput_heatmap_max_tokens_chunk.png",
             title="Throughput by max tokens and chunk size",
+        ),
+        plot_heatmap(
+            ok_rows,
+            plot_dir,
+            x_key="chunk_size",
+            y_key="prompt_len",
+            metric="throughput_tokens_per_sec",
+            fixed={"batch_size": fixed_batch_size, "max_tokens": fixed_max_tokens, "sd_rate": fixed_sd_rate},
+            filename="throughput_heatmap_prompt_len_chunk.png",
+            title="Throughput by prompt length and chunk size",
         ),
     ]
     (plot_dir / "README_PLOTS.md").write_text(
@@ -469,9 +511,8 @@ def main() -> None:
     full_results = []
     for index, item in enumerate(configs):
         item = dict(item)
-        item["prompt_len"] = args.prompt_len
         print(
-            f"[{index + 1}/{len(configs)}] batch={item['batch_size']} max_tokens={item['max_tokens']} "
+            f"[{index + 1}/{len(configs)}] batch={item['batch_size']} prompt_len={item['prompt_len']} max_tokens={item['max_tokens']} "
             f"chunk={item['chunk_size']} sd_rate={item['sd_rate']}"
         )
         try:
@@ -508,7 +549,7 @@ def main() -> None:
         rows.append(row)
         full_results.append(result)
         raw_path = raw_dir / (
-            f"batch{item['batch_size']}_max{item['max_tokens']}_chunk{item['chunk_size']}_sd{item['sd_rate']}.json"
+            f"batch{item['batch_size']}_prompt{item['prompt_len']}_max{item['max_tokens']}_chunk{item['chunk_size']}_sd{item['sd_rate']}.json"
         )
         raw_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
